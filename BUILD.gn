@@ -1,0 +1,93 @@
+# Copyright (c) 2024-2025 Huawei Device Co., Ltd.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import("//build/ohos.gni")
+
+# ohscrcpy: OpenHarmony screen mirroring tool
+# 通过 AVScreenCapture 采集 H264 裸流，通过内置 RTSP 服务器分发，
+# 同时开放控制端口接收鼠标/触摸输入注入。
+ohos_executable("ohscrcpy") {
+  install_enable = true
+
+  sanitize = {
+    cfi = true
+    cfi_cross_dso = true
+    debug = false
+  }
+
+  sources = [
+    "main.cpp",
+    "screen_capture.cpp",
+    "server.cpp",
+    "input.cpp",
+  ]
+
+  cflags = [
+    "-std=c++17",
+    "-Wall",
+    "-Wextra",
+    "-Wno-unused-parameter",
+  ]
+
+  cflags_cc = [ "-std=c++17" ]
+
+  include_dirs = [
+    ".",
+    # C++ AVScreenCapture inner API 头文件
+    "//foundation/multimedia/player_framework/interfaces/inner_api/native",
+    # SurfaceBuffer 头文件
+    "//foundation/graphic/graphic_surface/interfaces/inner_api/surface",
+    # buffer_handle.h
+    "//foundation/graphic/graphic_surface/interfaces/inner_api/utils",
+    # audio_info.h（screen_capture.h inner API 依赖）
+    "//foundation/multimedia/audio_framework/interfaces/inner_api/native/audiocommon/include",
+    # InputManager C++ API 头文件
+    "//foundation/multimodalinput/input/interfaces/native/innerkits/event/include",
+    # DisplayManagerLite（获取真实屏幕分辨率）
+    "//foundation/window/window_manager/interfaces/innerkits/dm_lite",
+    # iremote_broker.h（input_manager.h 间接依赖）
+    "//foundation/communication/ipc/interfaces/innerkits/ipc_core/include",
+    # AVCodecVideoEncoder C++ inner API
+    "//foundation/multimedia/av_codec/interfaces/inner_api/native",
+    # Format / AVBuffer / meta_key
+    "//foundation/multimedia/media_foundation/interface/inner_api",
+    "//foundation/multimedia/media_foundation/interface/inner_api/meta",
+    "//foundation/multimedia/media_foundation/interface/inner_api/buffer",
+  ]
+
+  # player_framework:media_client 与本目标同属 player_framework 部件，必须用 deps
+  deps = [
+    "//foundation/multimedia/player_framework/interfaces/inner_api/native:media_client",
+  ]
+
+  external_deps = [
+    "bounds_checking_function:libsec_shared",
+    "c_utils:utils",
+    "graphic_surface:surface",
+    "hilog:libhilog",
+    "input:libmmi-client",
+    "ipc:ipc_core",
+    "media_foundation:native_media_core",
+    "media_foundation:media_foundation",
+    "av_codec:av_codec_client",
+    "window_manager:libdm_lite",
+  ]
+
+  libs = [
+    "pthread",
+    "dl",
+  ]
+
+  subsystem_name = "multimedia"
+  part_name = "player_framework"
+}
