@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import("//build/ohos.gni")
+import("//foundation/multimedia/player_framework/config.gni")
 
 # ohscrcpy: OpenHarmony screen mirroring tool
 # 通过 AVScreenCapture 采集 H264 裸流，通过内置 RTSP 服务器分发，
@@ -90,4 +91,51 @@ ohos_executable("ohscrcpy") {
 
   subsystem_name = "multimedia"
   part_name = "player_framework"
+}
+
+
+ohos_executable("avplay") {
+  install_enable = false
+
+  sources = [ "avplay.cpp" ]
+
+  cflags = [
+    "-std=c++17",
+    "-Wall",
+    "-Werror",
+    "-Wno-deprecated-declarations",
+  ]
+
+  cflags_cc = [ "-std=c++17" ]
+
+  sanitize = {
+    cfi             = true
+    cfi_cross_dso   = true
+    debug           = false
+  }
+
+  include_dirs = [
+    "//foundation/multimedia/player_framework/interfaces/inner_api/native",
+  ]
+
+  deps = [
+    "$MEDIA_PLAYER_ROOT_DIR/services/utils:media_service_utils",
+    "//foundation/multimedia/player_framework/interfaces/inner_api/native:media_client",
+  ]
+
+  # Link against the C++ inner API library (media_client).
+  external_deps = [
+    "audio_framework:audio_client",
+    "c_utils:utils",
+    "graphic_2d:librender_service_base",
+    "graphic_2d:librender_service_client",
+    "graphic_surface:surface",
+    "hilog:libhilog",
+    "ipc:ipc_single",
+    "media_foundation:media_foundation",
+    "window_manager:libwm",
+  ]
+
+  subsystem_name = "multimedia"
+  part_name      = "player_framework"
 }
