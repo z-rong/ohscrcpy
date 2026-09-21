@@ -13,8 +13,8 @@
  * limitations under the License.
  */
 
-#ifndef OHSCRCPY_SCREEN_CAPTURE_H
-#define OHSCRCPY_SCREEN_CAPTURE_H
+#ifndef OHSCRCPY_CAPTURE_H
+#define OHSCRCPY_CAPTURE_H
 
 #include <cstdint>
 #include <functional>
@@ -22,10 +22,7 @@
 #include <memory>
 
 #include "surface.h"
-
-// C++ AVScreenCapture inner API（用相对路径避免与本文件同名冲突）
-#include "../../interfaces/inner_api/native/screen_capture.h"
-// C++ AVCodecVideoEncoder inner API
+#include "screen_capture.h"
 #include "avcodec_common.h"
 #include "avcodec_video_encoder.h"
 #include "meta/format.h"
@@ -44,29 +41,19 @@ using NaluCallback = std::function<void(const uint8_t *data, int32_t size,
                                         int64_t pts, bool isKey)>;
 
 /** 屏幕采集 + 编码配置 */
-struct ScreenCaptureConfig {
-    int32_t width    = 1280;
-    int32_t height   = 720;
+struct CaptureConfig {
+    int32_t width    = 1920;
+    int32_t height   = 1080;
     int32_t fps      = 30;
     int32_t bitrate  = 4000000; // bps
     int32_t rotation = 0;        // 视频旋转角度（0/90/180/270），用于竖屏当横屏等场景
     NaluCallback onNalu;
 };
 
-/**
- * @brief 屏幕采集（C++ inner API）+ H.264 编码（C++ inner API）封装
- *
- * 流程（Surface 模式零拷贝）：
- *   1. InitEncoder → CreateInputSurface() 得到编码器 Surface
- *   2. Start → StartScreenCaptureWithSurface(encoderSurface_)
- *      采集器直接将帧写入编码器 Surface，无需回调中转
- *   3. 编码器从 Surface 直接消费，OnOutputBufferAvailable → onNalu
- *   CPU 全程不接触像素数据，无 memcpy
- */
-class ScreenCapture {
+class Capture {
 public:
-    explicit ScreenCapture(const ScreenCaptureConfig &cfg);
-    ~ScreenCapture();
+    explicit Capture(const CaptureConfig &cfg);
+    ~Capture();
 
     bool Start();
     void Stop();
@@ -76,10 +63,10 @@ public:
     void RequestIDRFrame();
 
 private:
-    // ── C++ ScreenCaptureCallBack 内部类 ────────────────────────────────────
+    // ── 采集回调（继承框架 ScreenCaptureCallBack）───────────────────────────
     class CaptureCallback : public OHOS::Media::ScreenCaptureCallBack {
     public:
-        explicit CaptureCallback(ScreenCapture *owner) : owner_(owner) {}
+        explicit CaptureCallback(Capture *owner) : owner_(owner) {}
         void OnError(OHOS::Media::ScreenCaptureErrorType errorType,
                      int32_t errorCode) override;
         void OnAudioBufferAvailable(bool isReady,
@@ -87,13 +74,13 @@ private:
         void OnVideoBufferAvailable(bool isReady) override;
         void OnStateChange(OHOS::Media::AVScreenCaptureStateCode stateCode) override;
     private:
-        ScreenCapture *owner_;
+        Capture *owner_;
     };
 
     // ── MediaCodecCallback 内部类（C++ 编码器回调）───────────────────────────
     class EncCallback : public OHOS::MediaAVCodec::MediaCodecCallback {
     public:
-        explicit EncCallback(ScreenCapture *owner) : owner_(owner) {}
+        explicit EncCallback(Capture *owner) : owner_(owner) {}
         void OnError(OHOS::MediaAVCodec::AVCodecErrorType type,
                      int32_t errorCode) override;
         void OnOutputFormatChanged(const OHOS::Media::Format &format) override;
@@ -103,13 +90,13 @@ private:
         void OnOutputBufferAvailable(uint32_t index,
                                      std::shared_ptr<OHOS::Media::AVBuffer> buffer) override;
     private:
-        ScreenCapture *owner_;
+        Capture *owner_;
     };
 
     bool InitEncoder();
     void DestroyEncoder();
 
-    ScreenCaptureConfig cfg_;
+    CaptureConfig cfg_;
     std::shared_ptr<OHOS::Media::ScreenCapture> capture_;
     std::shared_ptr<OHOS::MediaAVCodec::AVCodecVideoEncoder> encoder_;
     std::atomic<bool> running_{false};
@@ -120,7 +107,7 @@ private:
 
 } // namespace ohscrcpy
 
-using ScreenCaptureConfig  = ohscrcpy::ScreenCaptureConfig;
-using ScreenCapture = ohscrcpy::ScreenCapture;
+using CaptureConfig = ohscrcpy::CaptureConfig;
+using Capture       = ohscrcpy::Capture;
 
-#endif // OHSCRCPY_SCREEN_CAPTURE_H
+#endif // OHSCRCPY_CAPTURE_H

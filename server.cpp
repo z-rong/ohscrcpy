@@ -15,10 +15,10 @@
 
 /**
  * @file server.cpp
- * @brief TCP H.264 NALU 流服务器
+ * @brief TCP H.264 NALU 视频流服务器
  *
- * 监听 TCP 端口，将 H.264 NALU 以自定义二进制协议推送给所有连接的客户端。
- * 帧协议（小端序）：magic(4) + flags(1) + pts(8) + size(4) + data
+ * 监听 TCP 端口或 Unix Domain Socket，将 H.264 NALU 按下方帧协议推送给所有连接的客户端。
+ * 帧协议（小端序）：magic(4) + flags(1) + pts(8) + size(4) + width(4) + height(4) + data
  *   flags bit0: isKey
  */
 
@@ -87,7 +87,7 @@ bool Server::Start()
 
         running_ = true;
         acceptThread_ = std::thread(&Server::AcceptLoop, this);
-        HILOG_INFO(LOG_CORE, "帧流服务器已启动（abstract: %{public}s）", sockName_.c_str());
+        HILOG_INFO(LOG_CORE, "TCP 视频服务器已启动（abstract: %{public}s）", sockName_.c_str());
         return true;
     }
 
@@ -122,7 +122,7 @@ bool Server::Start()
 
     running_ = true;
     acceptThread_ = std::thread(&Server::AcceptLoop, this);
-    HILOG_INFO(LOG_CORE, "帧流服务器已启动，端口 %{public}d", port_);
+    HILOG_INFO(LOG_CORE, "TCP 视频服务器已启动，端口 %{public}d", port_);
     return true;
 }
 
@@ -143,7 +143,7 @@ void Server::Stop()
         close(fd);
     }
     clients_.clear();
-    HILOG_INFO(LOG_CORE, "帧流服务器已停止");
+    HILOG_INFO(LOG_CORE, "TCP 视频服务器已停止");
 }
 
 void Server::AcceptLoop()

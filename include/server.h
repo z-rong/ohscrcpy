@@ -28,8 +28,8 @@
  * limitations under the License.
  */
 
-#ifndef OHSCRCPY_RTSP_SERVER_H
-#define OHSCRCPY_RTSP_SERVER_H
+#ifndef OHSCRCPY_SERVER_H
+#define OHSCRCPY_SERVER_H
 
 #include <cstdint>
 #include <vector>
@@ -37,12 +37,13 @@
 #include <mutex>
 #include <atomic>
 #include <functional>
+#include <string>
 #include <cstring>
 
 namespace ohscrcpy {
 
 /**
- * @brief H.264 NALU 流服务器（TCP 或 Unix Domain Socket）
+ * @brief H.264 NALU 视频流服务器（TCP 或 Unix Domain Socket）
  *
  * 支持两种监听模式：
  *   1. TCP 端口（默认）：监听 INADDR_ANY:port，适合网络直连
@@ -50,11 +51,13 @@ namespace ohscrcpy {
  *      配合 hdc fport localabstract 使用，绕过 TCP 协议栈，延迟更低
  *
  * 帧协议（小端序）：
- *   [magic:4]  固定 0x4F485343 ("OHSC")
- *   [flags:1]  bit0 = isKey（关键帧标志）
- *   [pts:8]    时间戳（微秒，int64）
- *   [size:4]   NALU 数据字节数
- *   [data]     H.264 NALU 数据
+ *   [magic:4]   固定 0x4F485343 ("OHSC")
+ *   [flags:1]   bit0 = isKey（关键帧标志）
+ *   [pts:8]     时间戳（微秒，int64）
+ *   [size:4]    NALU 数据字节数
+ *   [width:4]   视频宽度（像素）
+ *   [height:4]  视频高度（像素）
+ *   [data]      H.264 NALU 数据
  */
 class Server {
 public:
@@ -132,4 +135,4 @@ private:
 
 using Server = ohscrcpy::Server;
 
-#endif // OHSCRCPY_RTSP_SERVER_H
+#endif // OHSCRCPY_SERVER_H

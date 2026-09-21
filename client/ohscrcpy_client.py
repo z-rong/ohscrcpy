@@ -145,7 +145,7 @@ class HdcSession:
 
         # setsid 让进程脱离 hdc shell 的进程组，hdc shell 退出后不会被杀
         cmd = self._hdc_cmd("shell",
-            f"setsid {DEVICE_PATH} --abstract > /dev/null 2>&1 &")
+            f"setsid {DEVICE_PATH} > /dev/null 2>&1 &")
         _log(f"$ {' '.join(cmd)}")
         try:
             subprocess.run(cmd, timeout=5,
@@ -153,7 +153,7 @@ class HdcSession:
         except subprocess.TimeoutExpired:
             pass
         self._server_started = True
-        print(f"[hdc] 服务端已启动（{DEVICE_PATH} --abstract）")
+        print(f"[hdc] 服务端已启动（{DEVICE_PATH}）")
 
         # 等待服务端真正监听（最多 8 秒）
         # 通过检查 /proc/net/unix 里 abstract socket 是否出现来确认，
@@ -258,6 +258,21 @@ class CtrlClient:
                 print(f"[ctrl] 发送失败: {e}，反控已断开")
                 self._closed = True
 
+    def swipe(self, x1, y1, x2, y2, duration=0.12, steps=6):
+        """注入一次滑动：触摸按下 → 分步移动 → 抬起。
+        等价于设备端执行 uinput -T -m x1 y1 x2 y2，用于触发屏幕刷新"""
+        if self._closed:
+            return
+        self.mouse_button(x1, y1, 1, True)
+        step = duration / steps if steps > 0 else 0
+        for i in range(1, steps + 1):
+            if step > 0:
+                time.sleep(step)
+            self.mouse_move(x1 + (x2 - x1) * i // steps,
+                            y1 + (y2 - y1) * i // steps)
+        time.sleep(0.03)
+        self.mouse_button(x2, y2, 1, False)
+
     def mouse_move(self, x, y):
         self._send(struct.pack("<Bii", MSG_MOUSE_MOVE, x, y))
 
@@ -296,6 +311,11 @@ class NaluRelay:
         self._out_size_ready = threading.Event()  # 主线程设好输出尺寸后置位
         self._record_path = record_path
         self._record_file = None
+        self._first_data = threading.Event()   # 收到首个 NALU 后置位
+
+    def wait_first_data(self, timeout):
+        """等待首个视频 NALU 到达，返回是否已收到"""
+        return self._first_data.wait(timeout)
 
     def set_output_size(self, w, h):
         """设置 ffmpeg 输出分辨率，通知 relay 线程可以启动 ffmpeg"""
@@ -406,6 +426,7 @@ class NaluRelay:
 
                 self._dev_width = dev_w
                 self._dev_height = dev_h
+                self._first_data.set()
                 print(f"[video] 设备分辨率 {dev_w}x{dev_h}")
 
                 # 等待主线程设好输出尺寸（win_w x win_h）
@@ -545,6 +566,18 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
     # 启动 NALU 转发
     relay = NaluRelay(host, video_port, record_path=record_path)
     relay.start()
+
+    # 等待屏幕数据：OH 动态帧率下静态画面编码器不出帧会一直无数据，
+    # 迟迟等不到时反控注入滑动触发出帧（实测一次可能不够，最多两次）
+    for i in range(2):
+        if relay.wait_first_data(timeout=2.0):
+            break
+        if ctrl:
+            print(f"[main] 未收到视频数据，反控注入滑动触发出帧（第 {i + 1} 次）")
+            ctrl.swipe(200, 200, 400, 200)
+        else:
+            print("[main] 未收到视频数据且反控不可用")
+            break
 
     # 等待分辨率
     print("[main] 等待设备分辨率...")

@@ -14,9 +14,6 @@
 import("//build/ohos.gni")
 import("//foundation/multimedia/player_framework/config.gni")
 
-# ohscrcpy: OpenHarmony screen mirroring tool
-# 通过 AVScreenCapture 采集 H264 裸流，通过内置 RTSP 服务器分发，
-# 同时开放控制端口接收鼠标/触摸输入注入。
 ohos_executable("ohscrcpy") {
   install_enable = true
 
@@ -28,7 +25,7 @@ ohos_executable("ohscrcpy") {
 
   sources = [
     "main.cpp",
-    "screen_capture.cpp",
+    "capture.cpp",
     "server.cpp",
     "input.cpp",
   ]
@@ -44,29 +41,20 @@ ohos_executable("ohscrcpy") {
 
   include_dirs = [
     ".",
-    # C++ AVScreenCapture inner API 头文件
+    "include",
     "//foundation/multimedia/player_framework/interfaces/inner_api/native",
-    # SurfaceBuffer 头文件
     "//foundation/graphic/graphic_surface/interfaces/inner_api/surface",
-    # buffer_handle.h
     "//foundation/graphic/graphic_surface/interfaces/inner_api/utils",
-    # audio_info.h（screen_capture.h inner API 依赖）
     "//foundation/multimedia/audio_framework/interfaces/inner_api/native/audiocommon/include",
-    # InputManager C++ API 头文件
     "//foundation/multimodalinput/input/interfaces/native/innerkits/event/include",
-    # DisplayManagerLite（获取真实屏幕分辨率）
     "//foundation/window/window_manager/interfaces/innerkits/dm_lite",
-    # iremote_broker.h（input_manager.h 间接依赖）
     "//foundation/communication/ipc/interfaces/innerkits/ipc_core/include",
-    # AVCodecVideoEncoder C++ inner API
     "//foundation/multimedia/av_codec/interfaces/inner_api/native",
-    # Format / AVBuffer / meta_key
     "//foundation/multimedia/media_foundation/interface/inner_api",
     "//foundation/multimedia/media_foundation/interface/inner_api/meta",
     "//foundation/multimedia/media_foundation/interface/inner_api/buffer",
   ]
 
-  # player_framework:media_client 与本目标同属 player_framework 部件，必须用 deps
   deps = [
     "//foundation/multimedia/player_framework/interfaces/inner_api/native:media_client",
   ]
@@ -123,7 +111,6 @@ ohos_executable("avplay") {
     "//foundation/multimedia/player_framework/interfaces/inner_api/native:media_client",
   ]
 
-  # Link against the C++ inner API library (media_client).
   external_deps = [
     "audio_framework:audio_client",
     "c_utils:utils",

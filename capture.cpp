@@ -14,7 +14,7 @@
  */
 
 /**
- * @file screen_capture.cpp
+ * @file capture.cpp
  * @brief 屏幕采集（C++ inner API）+ H.264 编码（C++ inner API）实现
  *
  * 流程（Surface 模式零拷贝）：
@@ -28,7 +28,7 @@
  *   减少一次 BufferQueue 流转，延迟更低。
  */
 
-#include "screen_capture.h"
+#include "capture.h"
 
 #include <cstdio>
 
@@ -52,18 +52,18 @@ using namespace OHOS::Media;
 
 namespace ohscrcpy {
 
-ScreenCapture::ScreenCapture(const ScreenCaptureConfig &cfg)
+Capture::Capture(const CaptureConfig &cfg)
     : cfg_(cfg)
 {
 }
 
-ScreenCapture::~ScreenCapture()
+Capture::~Capture()
 {
     Stop();
 }
 
 // ── 编码器初始化（Surface 输入模式）────────────────────────────────────────
-bool ScreenCapture::InitEncoder()
+bool Capture::InitEncoder()
 {
     encoder_ = VideoEncoderFactory::CreateByMime(
         std::string(CodecMimeType::VIDEO_AVC));
@@ -133,7 +133,7 @@ bool ScreenCapture::InitEncoder()
     return true;
 }
 
-void ScreenCapture::DestroyEncoder()
+void Capture::DestroyEncoder()
 {
     if (encoder_ == nullptr) { return; }
     encoder_->Stop();
@@ -144,7 +144,7 @@ void ScreenCapture::DestroyEncoder()
 }
 
 // 请求编码器立即输出一个 IDR 帧
-void ScreenCapture::RequestIDRFrame()
+void Capture::RequestIDRFrame()
 {
     if (encoder_ == nullptr) { return; }
     Format fmt;
@@ -154,7 +154,7 @@ void ScreenCapture::RequestIDRFrame()
 }
 
 // ── 启动 / 停止 ──────────────────────────────────────────────────────────────
-bool ScreenCapture::Start()
+bool Capture::Start()
 {
     if (running_.load()) { return true; }
 
@@ -200,7 +200,7 @@ bool ScreenCapture::Start()
 
     ret = capture_->Init(config);
     if (ret != SCREEN_CAPTURE_ERR_OK) {
-        HILOG_ERROR(LOG_CORE, "ScreenCapture::Init 失败: %{public}d", ret);
+        HILOG_ERROR(LOG_CORE, "Capture::Init 失败: %{public}d", ret);
         capture_->Release();
         capture_.reset();
         DestroyEncoder();
@@ -235,7 +235,7 @@ bool ScreenCapture::Start()
     return true;
 }
 
-void ScreenCapture::Stop()
+void Capture::Stop()
 {
     if (!running_.exchange(false)) { return; }
 
@@ -251,20 +251,20 @@ void ScreenCapture::Stop()
 
 // ── CaptureCallback 实现 ─────────────────────────────────────────────────────
 
-void ScreenCapture::CaptureCallback::OnError(
+void Capture::CaptureCallback::OnError(
     ScreenCaptureErrorType /*errorType*/, int32_t errorCode)
 {
     HILOG_ERROR(LOG_CORE, "采集错误: %{public}d", errorCode);
     if (owner_) { owner_->running_.store(false); }
 }
 
-void ScreenCapture::CaptureCallback::OnAudioBufferAvailable(
+void Capture::CaptureCallback::OnAudioBufferAvailable(
     bool /*isReady*/, AudioCaptureSourceType /*type*/)
 {
     // 不采集音频，忽略
 }
 
-void ScreenCapture::CaptureCallback::OnStateChange(
+void Capture::CaptureCallback::OnStateChange(
     AVScreenCaptureStateCode stateCode)
 {
     switch (stateCode) {
@@ -289,7 +289,7 @@ void ScreenCapture::CaptureCallback::OnStateChange(
     }
 }
 
-void ScreenCapture::CaptureCallback::OnVideoBufferAvailable(bool isReady)
+void Capture::CaptureCallback::OnVideoBufferAvailable(bool isReady)
 {
     // Surface 模式下，采集器直接写入编码器 Surface，此回调不再触发。
     // 保留空实现以满足接口要求。
@@ -301,19 +301,19 @@ void ScreenCapture::CaptureCallback::OnVideoBufferAvailable(bool isReady)
 
 // ── EncCallback 实现 ─────────────────────────────────────────────────────────
 
-void ScreenCapture::EncCallback::OnError(AVCodecErrorType /*type*/,
+void Capture::EncCallback::OnError(AVCodecErrorType /*type*/,
                                                  int32_t errorCode)
 {
     HILOG_ERROR(LOG_CORE, "编码器错误: %{public}d", errorCode);
     if (owner_) { owner_->running_.store(false); }
 }
 
-void ScreenCapture::EncCallback::OnOutputFormatChanged(const Format & /*fmt*/)
+void Capture::EncCallback::OnOutputFormatChanged(const Format & /*fmt*/)
 {
     HILOG_INFO(LOG_CORE, "编码器格式变化");
 }
 
-void ScreenCapture::EncCallback::OnOutputBufferAvailable(
+void Capture::EncCallback::OnOutputBufferAvailable(
     uint32_t index, std::shared_ptr<AVBuffer> buffer)
 {
     if (owner_ == nullptr || buffer == nullptr) { return; }
