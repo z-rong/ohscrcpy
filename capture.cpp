@@ -86,7 +86,7 @@ bool Capture::InitEncoder()
     fmt.PutIntValue(Tag::VIDEO_HEIGHT,           cfg_.height);
     // Surface 输入模式像素格式由 Surface 决定，编码器侧设 NV12 或 RGBA 均可
     fmt.PutIntValue(Tag::VIDEO_PIXEL_FORMAT,     static_cast<int32_t>(OHOS::Media::VideoPixelFormat::RGBA));
-    fmt.PutIntValue(Tag::VIDEO_FRAME_RATE,       cfg_.fps);
+    fmt.PutDoubleValue(Tag::VIDEO_FRAME_RATE,    static_cast<double>(cfg_.fps));
     fmt.PutLongValue(Tag::MEDIA_BITRATE,         static_cast<int64_t>(cfg_.bitrate));
     fmt.PutIntValue(Tag::VIDEO_I_FRAME_INTERVAL, 0);     // 0 = 首帧强制 IDR
     // cvt 产品竖屏当横屏用，编码时标记旋转角度（客户端播放器会自动旋转显示）
