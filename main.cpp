@@ -66,6 +66,7 @@
 #include "server.h"
 #include "input.h"
 #include "display_manager_lite.h"
+#include "virtual_display.h"
 
 #undef LOG_TAG
 #define LOG_TAG "ohscrcpy"
@@ -78,6 +79,17 @@ struct OhscrcpyConfig {
     int32_t     width         = 1920;
     int32_t     height        = 1080;
     int32_t     fps           = 30;
+    // 码率（bps）：1080p 屏幕文字/图标边缘用 4Mbps 会明显发虚，默认 12Mbps
+    int32_t     bitrate       = 12000000;
+    // 关键帧间隔（毫秒）：0 会让 GOP=0（不周期刷新 I 帧）导致误差累积、越看越模糊
+    int32_t     iFrameIntervalMs = 1000;
+    // 码率控制模式：-1=不设置 0=CBR 1=VBR 2=CQ 3=SQR 11=CRF
+    int32_t     bitrateMode   = -1;
+    // 质量/QP（CQ 的 quality / CRF 的 target_qp；CRF 越小越清晰，建议 18~26）
+    int32_t     quality       = -1;
+    // 虚拟屏密度 DPI（VPR = dpi/160）：清晰度关键项。
+    // 240 => VPR 1.5（UI 按 1280x720 排版后放大，偏糊）；160 => VPR 1.0（1:1 最清晰）
+    uint32_t    densityDpi    = 240;
     int32_t     videoPort     = 8554;
     int32_t     ctrlPort      = 8555;
     bool        debug         = false;  // 将编码后的 H.264 码流保存到 kDebugDumpPath
@@ -90,6 +102,18 @@ struct OhscrcpyConfig {
 
 namespace {
 
+/** 把 --rate-mode 的字符串转成 OH VideoEncodeBitrateMode；非法返回 -2 */
+int32_t ParseRateMode(const char *s)
+{
+    if (s == nullptr) { return -2; }
+    if (strcmp(s, "cbr") == 0) { return 0; }
+    if (strcmp(s, "vbr") == 0) { return 1; }
+    if (strcmp(s, "cq") == 0)  { return 2; }
+    if (strcmp(s, "sqr") == 0) { return 3; }
+    if (strcmp(s, "crf") == 0) { return 11; }
+    return -2;
+}
+
 void PrintUsage(const char *prog)
 {
     fprintf(stderr,
@@ -98,15 +122,24 @@ void PrintUsage(const char *prog)
         "选项:\n"
         "  -w <宽>         视频宽度（默认 1920）\n"
         "  -h <高>         视频高度（默认 1080）\n"
-        "  -b <码率>       视频码率 bps（默认 4000000）\n"
+        "  -b <码率>       视频码率：>=100000 按 bps，较小值按 Mbps（默认 12Mbps）\n"
         "  -f <帧率>       视频帧率（默认 30）\n"
         "  -p <视频端口>   TCP 视频服务端口（默认 8554）\n"
         "  -c <控制端口>   输入控制端口（默认 8555）\n"
+        "  -i <毫秒>       关键帧间隔 ms（默认 1000；调小更清晰但更占带宽，最小建议 500）\n"
+        "  --rate-mode <模式>\n"
+        "                  码率控制模式 cbr|vbr|cq|sqr|crf（默认不设置）\n"
+        "                  本机硬件(OMX.rk.video_encoder.avc)实测只支持 cbr / vbr；\n"
+        "                  cq / crf 会被硬件拒绝并导致采集直接失败，不要用\n"
+        "  --qp <n>        质量/QP：cq 模式作 quality、crf 模式作 target_qp\n"
+        "                  （当前硬件不支持 cq/crf，本项无效）\n"
+        "  --density <dpi> 虚拟屏密度（VPR = dpi/160），默认 240(=VPR1.5)\n"
+        "                  画面发虚时改小：160 即 VPR 1.0，UI 按 1:1 渲染最清晰\n"
         "  --debug         将编码后的 H.264 码流保存到 %s\n"
         "  --help          打印此帮助\n"
         "\n"
         "示例:\n"
-        "  %s -f 60\n",
+        "  %s -f 60 -b 20 --rate-mode crf --qp 20\n",
         kDebugDumpPath, prog, prog);
 }
 } // namespace
@@ -118,6 +151,8 @@ int main(int argc, char *argv[])
     cfg.width      = 1920;
     cfg.height     = 1080;
     cfg.fps        = 30;
+    cfg.bitrate    = 12000000;
+    cfg.iFrameIntervalMs = 1000;
     cfg.videoPort  = 8554;
     cfg.ctrlPort   = 8555;
 
@@ -125,30 +160,89 @@ int main(int argc, char *argv[])
     static const struct option kLongOpts[] = {
         {"help",       no_argument, nullptr, 1000},
         {"debug",      no_argument, nullptr, 1001},
+        {"rate-mode",  required_argument, nullptr, 1002},
+        {"qp",         required_argument, nullptr, 1003},
+        {"density",    required_argument, nullptr, 1004},
         {nullptr,      0,          nullptr, 0},
     };
 
     int opt;
     int longIdx = 0;
-    while ((opt = getopt_long(argc, argv, "w:h:f:p:c:", kLongOpts, &longIdx)) != -1) {
+    while ((opt = getopt_long(argc, argv, "w:h:f:b:p:c:i:", kLongOpts, &longIdx)) != -1) {
         switch (opt) {
             case 'w': cfg.width    = atoi(optarg); break;
             case 'h': cfg.height   = atoi(optarg); break;
             case 'f': cfg.fps      = atoi(optarg); break;
+            case 'b': {
+                // 兼容两种写法：>= 100000 视为 bps（如 12000000），较小的数视为 Mbps（如 12）
+                int32_t v = atoi(optarg);
+                if (v <= 0) {
+                    fprintf(stderr, "警告: 码率必须 > 0，忽略 -b %s\n", optarg);
+                    break;
+                }
+                cfg.bitrate = (v >= 100000) ? v : v * 1000000;
+                break;
+            }
+            case 'i': {
+                int32_t v = atoi(optarg);
+                if (v <= 0) {
+                    // 0 会让 GOP=0（不做周期 I 帧刷新），画面会越看越模糊
+                    fprintf(stderr, "警告: 关键帧间隔必须 > 0，已改用 1000ms\n");
+                    v = 1000;
+                }
+                cfg.iFrameIntervalMs = v;
+                break;
+            }
             case 'p': cfg.videoPort = atoi(optarg); break;
             case 'c': cfg.ctrlPort = atoi(optarg); break;
             case 1000:
                 PrintUsage(argv[0]);
                 return 0;
             case 1001: cfg.debug = true; break;
+            case 1002: {
+                int32_t m = ParseRateMode(optarg);
+                if (m == -2) {
+                    fprintf(stderr, "错误: --rate-mode 只支持 cbr|vbr|cq|sqr|crf，收到 \"%s\"\n", optarg);
+                    return 1;
+                }
+                cfg.bitrateMode = m;
+                break;
+            }
+            case 1003: {
+                int32_t v = atoi(optarg);
+                if (v < 0) {
+                    fprintf(stderr, "警告: --qp 必须 >= 0，忽略\n");
+                    break;
+                }
+                cfg.quality = v;
+                break;
+            }
+            case 1004: {
+                int32_t v = atoi(optarg);
+                if (v <= 0) {
+                    fprintf(stderr, "警告: --density 必须 > 0，忽略\n");
+                    break;
+                }
+                cfg.densityDpi = static_cast<uint32_t>(v);
+                break;
+            }
             default:
                 PrintUsage(argv[0]);
                 return 1;
         }
     }
 
-    // —— 查询真实屏幕分辨率（用户未手动指定时自动获取）——
-    if (cfg.width == 1920 && cfg.height == 1080) {
+    // —— 判断设备是否有【真实】屏幕 ——
+    // 不能只看「有没有默认屏」：本工具自己创建的虚拟屏也是默认屏（尤其是上次进程被强杀
+    // 时留下的那块），那样会误判为「有真实屏」而走 AVScreenCapture 并再次失败。
+    const bool hasDisplay = ohscrcpy::HasRealDisplay();
+    if (!hasDisplay) {
+        HILOG_WARN(LOG_CORE, "未检测到真实屏幕（设备无物理显示器），将使用虚拟屏直连编码器模式");
+    }
+
+    // —— 有真实屏幕时查询真实分辨率（用户未手动指定时自动获取）——
+    // 无屏时虚拟屏尺寸就是我们请求的 cfg.width x cfg.height，无需查询。
+    if (hasDisplay && cfg.width == 1920 && cfg.height == 1080) {
         auto display = OHOS::Rosen::DisplayManagerLite::GetInstance().GetDefaultDisplay();
         if (display != nullptr) {
             int32_t w = display->GetWidth();
@@ -165,9 +259,11 @@ int main(int argc, char *argv[])
     }
 
     HILOG_INFO(LOG_CORE,
-        "ohscrcpy 启动: %{public}dx%{public}d @%{public}dfps, "
+        "ohscrcpy 启动: %{public}dx%{public}d @%{public}dfps, 码率=%{public}dbps, "
+        "关键帧间隔=%{public}dms, 码率模式=%{public}d, 质量/QP=%{public}d, "
         "视频端口=%{public}d, 控制端口=%{public}d",
-        cfg.width, cfg.height, cfg.fps, cfg.videoPort, cfg.ctrlPort);
+        cfg.width, cfg.height, cfg.fps, cfg.bitrate, cfg.iFrameIntervalMs,
+        cfg.bitrateMode, cfg.quality, cfg.videoPort, cfg.ctrlPort);
 
     // —— 注册信号（恢复默认行为，不拦截）——
     // 不注册自定义 SignalHandler，SIGINT/SIGTERM 直接终止进程，
@@ -211,6 +307,10 @@ int main(int argc, char *argv[])
     capCfg.width  = cfg.width;
     capCfg.height = cfg.height;
     capCfg.fps    = cfg.fps;
+    capCfg.bitrate = cfg.bitrate;
+    capCfg.iFrameIntervalMs = cfg.iFrameIntervalMs;
+    capCfg.bitrateMode = cfg.bitrateMode;
+    capCfg.quality = cfg.quality;
     // H.264 NALU 回调 —— 推送到 TCP 视频服务器
     capCfg.onNalu = [&video, h264Fd](const uint8_t *data, int32_t size,
                                      int64_t pts, bool isKey) {
@@ -226,11 +326,30 @@ int main(int argc, char *argv[])
     };
 
     auto capture = std::make_unique<Capture>(capCfg);
-    if (!capture->Start()) {
-        HILOG_ERROR(LOG_CORE, "屏幕采集启动失败");
-        return 1;
+
+    if (hasDisplay) {
+        // 有真实屏幕：走原有 AVScreenCapture 流程
+        if (!capture->Start()) {
+            HILOG_ERROR(LOG_CORE, "屏幕采集启动失败");
+            return 1;
+        }
+        HILOG_INFO(LOG_CORE, "屏幕采集已启动");
+    } else {
+        // 无物理显示器：建一块虚拟屏，并把「编码器输入 Surface」交给它，
+        // 由 RS 把该屏的合成结果直接渲染进编码器 —— 完全绕开 AVScreenCapture。
+        auto encoderSurface = capture->PrepareEncoderForExternalInput();
+        if (encoderSurface == nullptr) {
+            HILOG_ERROR(LOG_CORE, "编码器输入 Surface 创建失败，无法建立虚拟屏");
+            return 1;
+        }
+        if (!ohscrcpy::CreateVirtualDisplayAsDefault(cfg.width, cfg.height, encoderSurface,
+                                                     cfg.densityDpi)) {
+            HILOG_ERROR(LOG_CORE, "虚拟屏创建失败");
+            return 1;
+        }
+        capture->StartExternalInput();
+        HILOG_INFO(LOG_CORE, "屏幕采集已启动（虚拟屏直连编码器 Surface）");
     }
-    HILOG_INFO(LOG_CORE, "屏幕采集已启动");
 
     // 新客户端连接时请求 IDR 帧，确保客户端能立即收到 SPS/PPS
     video->SetNewClientCallback([&capture]() {
@@ -241,6 +360,8 @@ int main(int argc, char *argv[])
     pause();
 
     if (h264Fd >= 0) { close(h264Fd); }
+    // 回收本进程创建的虚拟屏（进程被信号直接杀掉时由 DMS 的 death recipient 兜底回收）
+    ohscrcpy::DestroyVirtualDisplay();
     HILOG_INFO(LOG_CORE, "ohscrcpy 已退出");
     return 0;
 }

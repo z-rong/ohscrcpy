@@ -28,6 +28,7 @@ ohos_executable("ohscrcpy") {
     "capture.cpp",
     "server.cpp",
     "input.cpp",
+    "virtual_display.cpp",
   ]
 
   cflags = [
@@ -48,6 +49,7 @@ ohos_executable("ohscrcpy") {
     "//foundation/multimedia/audio_framework/interfaces/inner_api/native/audiocommon/include",
     "//foundation/multimodalinput/input/interfaces/native/innerkits/event/include",
     "//foundation/window/window_manager/interfaces/innerkits/dm_lite",
+    "//foundation/graphic/graphic_2d/rosen/modules/render_service_base/include",
     "//foundation/communication/ipc/interfaces/innerkits/ipc_core/include",
     "//foundation/multimedia/av_codec/interfaces/inner_api/native",
     "//foundation/multimedia/media_foundation/interface/inner_api",
@@ -69,6 +71,7 @@ ohos_executable("ohscrcpy") {
     "media_foundation:native_media_core",
     "media_foundation:media_foundation",
     "av_codec:av_codec_client",
+    "window_manager:libdm",
     "window_manager:libdm_lite",
   ]
 

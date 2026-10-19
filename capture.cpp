@@ -88,7 +88,17 @@ bool Capture::InitEncoder()
     fmt.PutIntValue(Tag::VIDEO_PIXEL_FORMAT,     static_cast<int32_t>(OHOS::Media::VideoPixelFormat::RGBA));
     fmt.PutDoubleValue(Tag::VIDEO_FRAME_RATE,    static_cast<double>(cfg_.fps));
     fmt.PutLongValue(Tag::MEDIA_BITRATE,         static_cast<int64_t>(cfg_.bitrate));
-    fmt.PutIntValue(Tag::VIDEO_I_FRAME_INTERVAL, 0);     // 0 = 首帧强制 IDR
+    fmt.PutIntValue(Tag::VIDEO_I_FRAME_INTERVAL, cfg_.iFrameIntervalMs);
+    // 码率控制模式：屏幕文字要清晰，关键在 CQ/CRF 这类「按质量分配码率」的模式，
+    // 只调码率上限在静态画面上不会降低量化步长。
+    if (cfg_.bitrateMode >= 0) {
+        fmt.PutIntValue(Tag::VIDEO_ENCODE_BITRATE_MODE, cfg_.bitrateMode);
+    }
+    if (cfg_.quality >= 0) {
+        // CRF 模式取 target_qp，CQ 模式取 quality，两个 key 都填，由编码器按模式选用
+        fmt.PutIntValue(Tag::VIDEO_ENCODER_TARGET_QP, cfg_.quality);
+        fmt.PutIntValue(Tag::VIDEO_ENCODE_QUALITY, cfg_.quality);
+    }
     // cvt 产品竖屏当横屏用，编码时标记旋转角度（客户端播放器会自动旋转显示）
     fmt.PutIntValue(Tag::VIDEO_ROTATION,         cfg_.rotation);
 
@@ -151,6 +161,23 @@ void Capture::RequestIDRFrame()
     fmt.PutIntValue(Tag::VIDEO_REQUEST_I_FRAME, 1);
     int32_t ret = encoder_->SetParameter(fmt);
     HILOG_INFO(LOG_CORE, "RequestIDRFrame ret=%{public}d", ret);
+}
+
+OHOS::sptr<OHOS::Surface> Capture::PrepareEncoderForExternalInput()
+{
+    if (running_.load()) { return encoderSurface_; }
+    if (!InitEncoder()) { return nullptr; }
+    HILOG_INFO(LOG_CORE,
+               "编码器已就绪（Surface 输入）%{public}dx%{public}d @%{public}dfps，等待虚拟屏接入",
+               cfg_.width, cfg_.height, cfg_.fps);
+    return encoderSurface_;
+}
+
+void Capture::StartExternalInput()
+{
+    if (running_.exchange(true)) { return; }
+    HILOG_INFO(LOG_CORE, "虚拟屏已接入编码器 Surface，请求首个 IDR");
+    RequestIDRFrame();
 }
 
 // ── 启动 / 停止 ──────────────────────────────────────────────────────────────

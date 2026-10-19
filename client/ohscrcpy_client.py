@@ -52,10 +52,40 @@ LOCAL_VIDEO_PORT = 8554
 LOCAL_CTRL_PORT  = 8555
 
 VERBOSE = False
+# 窗口初始最大高度：0 = 直接用设备原始分辨率（1:1，最清晰）。
+# 渲染时也不会放大超过 1:1 —— 窗口被拉大于设备分辨率时只做 letterbox，
+# 避免上采样导致的发虚。
+MAX_HEIGHT = 0
+# 追加传给设备端 ohscrcpy 的参数（例如 "-b 20000000 -i 500"），用于调画质
+SERVER_ARGS = ""
 
 def _log(msg):
     if VERBOSE:
         print(msg)
+
+# ── 打包(frozen)环境下的资源定位 ─────────────────────────────────────────────
+def app_dirs():
+    """资源查找目录：exe 所在目录、解包临时目录(_MEIPASS)、脚本目录"""
+    dirs = []
+    if getattr(sys, "frozen", False):
+        dirs.append(os.path.dirname(os.path.abspath(sys.executable)))
+        if hasattr(sys, "_MEIPASS"):
+            dirs.append(sys._MEIPASS)
+    dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    return dirs
+
+def find_resource(name):
+    """在 app_dirs() 中查找文件，返回绝对路径或 None"""
+    for d in app_dirs():
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    return None
+
+def find_ffmpeg():
+    """优先用打包内置的 ffmpeg.exe，否则依赖 PATH"""
+    p = find_resource("ffmpeg.exe") if os.name == "nt" else find_resource("ffmpeg")
+    return p or "ffmpeg"
 
 # ── HdcSession：hdc 自动化 ───────────────────────────────────────────────────
 class HdcSession:
@@ -115,9 +145,10 @@ class HdcSession:
 
         self._run(self._hdc_cmd("shell", f"killall {SERVER_BIN}"),
                   check=False, timeout=5)
-        local_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), SERVER_BIN)
-        if not os.path.isfile(local_bin):
-            raise RuntimeError(f"找不到本地 {SERVER_BIN} 文件: {local_bin}")
+        local_bin = find_resource(SERVER_BIN)
+        if not local_bin:
+            raise RuntimeError(
+                f"找不到本地 {SERVER_BIN} 文件，请将其与程序放在同一目录")
         self._run(self._hdc_cmd("file", "send", local_bin, DEVICE_PATH), timeout=30)
         self._run(self._hdc_cmd("shell", f"chmod 755 {DEVICE_PATH}"))
         self._file_pushed = True
@@ -144,8 +175,12 @@ class HdcSession:
               f"tcp:{self.ctrl_port}→localabstract:{CTRL_SOCK_NAME}")
 
         # setsid 让进程脱离 hdc shell 的进程组，hdc shell 退出后不会被杀
+        # SERVER_ARGS 用于调画质（如 "-b 20000000 -i 500"）
+        extra = f" {SERVER_ARGS.strip()}" if SERVER_ARGS and SERVER_ARGS.strip() else ""
+        if extra:
+            print(f"[hdc] 追加设备端编码参数:{extra}")
         cmd = self._hdc_cmd("shell",
-            f"setsid {DEVICE_PATH} > /dev/null 2>&1 &")
+            f"setsid {DEVICE_PATH}{extra} > /dev/null 2>&1 &")
         _log(f"$ {' '.join(cmd)}")
         try:
             subprocess.run(cmd, timeout=5,
@@ -360,7 +395,7 @@ class NaluRelay:
     def _start_ffmpeg(self):
         """启动 ffmpeg，硬件解码 H.264，输出 bgr24 到 stdout（pipe:1）"""
         cmd = [
-            "ffmpeg",
+            find_ffmpeg(),
             "-hide_banner",
             "-loglevel", "error",
             # 低延迟输入
@@ -544,6 +579,13 @@ OH_KEY_MAP = {
 
 # ── 主循环 ────────────────────────────────────────────────────────────────────
 def run(args):
+    if args.direct:
+        # 直连模式：跳过 hdc 自动化，直接连接已就绪的服务端（调试用）
+        print(f"[direct] 直连 {args.direct}:{args.video_port}/{args.ctrl_port}")
+        _run_app(args.direct, args.video_port, args.ctrl_port,
+                 record_path=args.record)
+        return
+
     hdc_session = HdcSession(args.target)
     hdc_session.setup()
 
@@ -583,9 +625,9 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
     print("[main] 等待设备分辨率...")
     dev_w, dev_h = relay.get_resolution()
 
-    # 计算窗口初始尺寸（限制最大高度960）
-    max_h = 960
-    if dev_h > max_h:
+    # 计算窗口初始尺寸：默认按设备原始分辨率 1:1（最清晰），--max-height 可限制
+    max_h = MAX_HEIGHT
+    if max_h > 0 and dev_h > max_h:
         _scale = max_h / dev_h
         win_w = int(dev_w * _scale)
         win_h = max_h
@@ -618,7 +660,7 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
     def _map_mouse(px, py):
         """把 pygame 窗口坐标映射回设备坐标（letterbox 感知）"""
         sw, sh = screen.get_size()
-        scale = min(sw / dev_w, sh / dev_h)
+        scale = min(1.0, sw / dev_w, sh / dev_h)
         disp_w = int(dev_w * scale)
         disp_h = int(dev_h * scale)
         ox = (sw - disp_w) // 2
@@ -739,8 +781,8 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
                 # BGR → RGB（pygame 用 RGB）
                 frame_rgb = frame[:, :, ::-1]
                 surf = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
-                # letterbox 缩放
-                scale = min(sw / dev_w, sh / dev_h)
+                # letterbox 缩放：上限 1:1，绝不放大（放大必然发虚）
+                scale = min(1.0, sw / dev_w, sh / dev_h)
                 disp_w = int(dev_w * scale)
                 disp_h = int(dev_h * scale)
                 if disp_w != dev_w or disp_h != dev_h:
@@ -791,13 +833,55 @@ def parse_args():
                    help="显示详细日志")
     p.add_argument("-o", "--record", default=None,
                    help="录制 H.264 流到文件（如 record.h264）")
+    p.add_argument("--direct", default=None, metavar="HOST",
+                   help="跳过 hdc，直接连接 HOST 的视频/控制端口（调试用）")
+    p.add_argument("--video-port", type=int, default=LOCAL_VIDEO_PORT,
+                   help="直连模式视频端口（默认 8554）")
+    p.add_argument("--ctrl-port", type=int, default=LOCAL_CTRL_PORT,
+                   help="直连模式控制端口（默认 8555）")
+    p.add_argument("--max-height", type=int, default=0, metavar="N",
+                   help="窗口初始最大高度像素；0（默认）= 按设备原始分辨率 1:1 显示，最清晰")
+    p.add_argument("--server-args", default="", metavar="ARGS",
+                   help="追加传给设备端 ohscrcpy 的参数，用于调画质，"
+                        "如 --server-args \"-b 20000000 -i 500\"")
     args = p.parse_args()
-    global VERBOSE
+    global VERBOSE, MAX_HEIGHT, SERVER_ARGS
     VERBOSE = args.verbose
+    MAX_HEIGHT = args.max_height
+    SERVER_ARGS = args.server_args or ""
     return args
 
 
 if __name__ == "__main__":
+    # OHS_LOGFILE: 同时把日志写入文件（无缓冲），便于打包版现场诊断
+    _log_path = os.environ.get("OHS_LOGFILE")
+    if _log_path:
+        try:
+            class _Tee:
+                def __init__(self, *streams):
+                    self._streams = streams
+
+                def write(self, s):
+                    for st in self._streams:
+                        try:
+                            st.write(s)
+                            st.flush()
+                        except OSError:
+                            pass
+                    return len(s)
+
+                def flush(self):
+                    for st in self._streams:
+                        try:
+                            st.flush()
+                        except OSError:
+                            pass
+
+            _lf = open(_log_path, "w", encoding="utf-8", buffering=1)
+            sys.stdout = _Tee(sys.stdout, _lf)
+            sys.stderr = _Tee(sys.stderr, _lf)
+        except OSError:
+            pass
     try:
         run(parse_args())
     except RuntimeError as e:
