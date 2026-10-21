@@ -21,6 +21,12 @@
 #include <thread>
 #include <string>
 
+namespace OHOS {
+namespace MMI {
+class InputEvent;
+} // namespace MMI
+} // namespace OHOS
+
 namespace ohscrcpy {
 
 /**
@@ -81,6 +87,17 @@ public:
     bool Start();
     void Stop();
 
+    /**
+     * @brief 指定注入事件的目标屏幕（displayId）
+     *
+     * 不设置时事件的目标屏幕由 MMI 用「默认显示组里第一个屏幕」推断（targetDisplayId = -1）。
+     * 无屏设备上这个推断恰好命中我们创建的虚拟屏，但一旦系统里同时存在多块屏
+     *（物理屏 + 虚拟屏、或遗留的虚拟屏），推断结果就可能不是我们正在编码的那块屏，
+     * 表现为「画面能看、点按没反应」。所以这里显式指定，保证注入落到正确的屏上。
+     * 传 -1 表示沿用 MMI 的默认推断。
+     */
+    void SetTargetDisplayId(int32_t displayId);
+
 private:
     void AcceptLoop();
     void HandleClient(int fd);
@@ -96,6 +113,9 @@ private:
     void InjectTouch      (int32_t action, uint8_t fingerId, int32_t x, int32_t y);
     void InjectKey        (int32_t action, int32_t keyCode);
 
+    // 给注入事件设置目标屏幕（targetDisplayId_ >= 0 时生效）
+    void ApplyTargetDisplay(OHOS::MMI::InputEvent *event);
+
     // 坐标从视频分辨率映射到实际屏幕分辨率
     int32_t MapX(int32_t x) const;
     int32_t MapY(int32_t y) const;
@@ -106,6 +126,8 @@ private:
     int listenFd_ = -1;
     bool         useAbstract_ = false;
     std::string  sockName_;
+    // 注入目标屏幕 id，-1 表示交给 MMI 推断
+    std::atomic<int32_t> targetDisplayId_{-1};
 
     std::atomic<bool> running_{false};
     std::thread       acceptThread_;

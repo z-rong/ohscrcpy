@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 
 import cv2
 import numpy as np
@@ -58,6 +59,9 @@ VERBOSE = False
 MAX_HEIGHT = 0
 # 追加传给设备端 ohscrcpy 的参数（例如 "-b 20000000 -i 500"），用于调画质
 SERVER_ARGS = ""
+# 检测到虚拟屏（无屏设备）时，是否自动重启桌面让它在虚拟屏上重建主窗口。
+# 关掉它就是旧行为：虚拟屏上只有一张壁纸，点了没有任何反应。
+RESTART_LAUNCHER = True
 
 def _log(msg):
     if VERBOSE:
@@ -89,11 +93,33 @@ def find_ffmpeg():
 
 # ── HdcSession：hdc 自动化 ───────────────────────────────────────────────────
 class HdcSession:
-    def __init__(self, target=None, video_port=LOCAL_VIDEO_PORT, ctrl_port=LOCAL_CTRL_PORT):
+    """单台设备的 hdc 自动化：推二进制、建端口转发、起服务端、清理。
+
+    这里踩过三个 hdc 的坑，必须按下面的方式处理：
+
+    1) hdc 的本地 TCP 端口是【全局】的，不按设备隔离。第二台设备再用 tcp:8554
+       会直接失败（[Fail]TCP Port listen failed at 8554）；旧代码把这个错误
+       吞掉后「直接复用」已有规则，于是两台设备同时看，画面永远来自第一台。
+       现在按设备 ID 分配互不冲突的端口槽（视频/控制成对）。
+    2) `hdc fport rm` 的任务串必须拆成【两个参数】localnode + remotenode。
+       传成一个带空格的字符串只会得到 [Fail]Remove forward ruler failed,
+       ruler is not exist，转发规则实际没有被删除 —— 这就是切换设备时
+       「端口转发移除没生效」、新设备连上还是老画面的根因。
+    3) hdc server 有时会把「已经不在 fport ls 里」的端口继续占据着
+       （实测 8554/8555 规则已删，127.0.0.1:8554 仍是 LISTENING），
+       这时再对同一端口 fport 必然失败。所以选端口前一定先做本地 bind 探测，
+       被占用的端口直接跳过，绝不「假设已有规则可用」。
+    """
+
+    # 设备槽位数：槽 k 使用 tcp:(8554+2k) / tcp:(8555+2k)
+    MAX_DEVICE_SLOTS = 40
+
+    def __init__(self, target=None, video_port=None, ctrl_port=None):
         self.target      = target
-        self.video_port  = video_port
-        self.ctrl_port   = ctrl_port
-        self._fport_set  = False
+        self.video_port  = video_port or LOCAL_VIDEO_PORT
+        self.ctrl_port   = ctrl_port or LOCAL_CTRL_PORT
+        # 本会话负责清理的转发规则 [(local_port, sock_name)]
+        self._forwards   = []
         self._server_started = False
         self._file_pushed     = False
 
@@ -111,18 +137,138 @@ class HdcSession:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=timeout)
-            output = (r.stdout or "").strip()
-            if VERBOSE and output:
-                _log(output)
-            if VERBOSE and (r.stderr or "").strip():
-                _log((r.stderr or "").strip())
-            if check:
-                if r.returncode != 0 or "[Fail]" in output or output.startswith("error"):
-                    msg = (r.stderr or "").strip() or output or f"exit code {r.returncode}"
-                    raise RuntimeError(f"{msg}")
-            return output
         except FileNotFoundError:
-            raise RuntimeError(f"找不到 hdc 命令，请确认 hdc 已安装并在 PATH 中")
+            raise RuntimeError("找不到 hdc 命令，请确认 hdc 已安装并在 PATH 中")
+        output = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        if VERBOSE and output:
+            _log(output)
+        if VERBOSE and err:
+            _log(err)
+        if check and (r.returncode != 0 or "[Fail]" in output or "[Fail]" in err
+                      or output.startswith("error")):
+            raise RuntimeError(err or output or f"exit code {r.returncode}")
+        return output
+
+    # ── 端口转发 ──────────────────────────────────────────────────────────
+    def _forward_rules(self):
+        """解析 `hdc fport ls`，返回 {本地端口: (设备 ID, remote node)}"""
+        rules = {}
+        out = self._run(["hdc", "fport", "ls"], check=False, timeout=10)
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            serial, local, remote = parts[0], parts[1], parts[2]
+            if not local.startswith("tcp:"):
+                continue
+            try:
+                port = int(local[4:])
+            except ValueError:
+                continue
+            rules[port] = (serial, remote)
+        return rules
+
+    @staticmethod
+    def _port_free(port):
+        """本地端口是否空闲（hdc 的 forward 监听在 127.0.0.1）"""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+
+    def _add_forward(self, port, sock_name):
+        out = self._run(self._hdc_cmd("fport", f"tcp:{port}",
+                                      f"localabstract:{sock_name}"),
+                        check=False, timeout=10)
+        return ("OK" in out) or ("success" in out.lower())
+
+    def _remove_forward(self, port, sock_name):
+        """删除一条转发并确认真的删掉了。
+
+        hdc fport rm 的正确写法是「localnode remotenode」两个独立参数：
+            hdc fport rm tcp:8554 localabstract:ohscrcpy_video
+        写成单个带空格的参数（旧代码的写法）会返回 ruler is not exist，
+        规则仍然留在 hdc server 里，导致切设备后依然连到上一台。
+        """
+        out = self._run(self._hdc_cmd("fport", "rm", f"tcp:{port}",
+                                      f"localabstract:{sock_name}"),
+                        check=False, timeout=10)
+        if "success" not in out.lower():
+            # 兜底：某些 hdc 版本只按 localnode 删除
+            out = self._run(self._hdc_cmd("fport", "rm", f"tcp:{port}"),
+                            check=False, timeout=10) or out
+        gone = port not in self._forward_rules()
+        print(f"[hdc] 移除端口转发 tcp:{port}→localabstract:{sock_name}: "
+              f"{'成功' if gone else '失败'} {out.strip()}".rstrip())
+        return gone
+
+    def _candidate_slots(self):
+        """以设备 ID 的散列作为起点，尽量让不同设备落在不同槽位"""
+        digest = zlib.crc32((self.target or "").encode("utf-8"))
+        start = digest % self.MAX_DEVICE_SLOTS
+        return [(start + i) % self.MAX_DEVICE_SLOTS
+                for i in range(self.MAX_DEVICE_SLOTS)]
+
+    def _setup_forwards(self):
+        """为当前设备挑一组空闲端口并建立视频/控制转发"""
+        rules = self._forward_rules()
+        conflicts = []
+
+        for slot in self._candidate_slots():
+            vport = LOCAL_VIDEO_PORT + slot * 2
+            cport = vport + 1
+            wanted = ((vport, VIDEO_SOCK_NAME), (cport, CTRL_SOCK_NAME))
+
+            # 每一步都要求「端口空闲」或「已被本设备同样的 remote 占用」
+            usable = True
+            for port, name in wanted:
+                owner = rules.get(port)
+                if owner is None:
+                    if not self._port_free(port):
+                        usable = False
+                        conflicts.append(f"tcp:{port} 被其它程序占用")
+                        break
+                elif not (owner[0] == self.target
+                          and owner[1].endswith(":" + name)):
+                    usable = False
+                    conflicts.append(
+                        f"tcp:{port} 已被设备 {owner[0]} 的 {owner[1]} 占用")
+                    break
+            if not usable:
+                continue
+
+            created = []
+            ok = True
+            for port, name in wanted:
+                if port in rules:
+                    # 本设备上次遗留的、remote 相同的规则，直接复用
+                    created.append((port, name))
+                    continue
+                if not self._add_forward(port, name):
+                    ok = False
+                    break
+                created.append((port, name))
+
+            if ok:
+                self.video_port, self.ctrl_port = vport, cport
+                self._forwards = created
+                return
+            # 回滚本槽位里刚刚新建的规则，换下一个槽
+            for port, name in created:
+                if port not in rules:
+                    self._remove_forward(port, name)
+
+        raise RuntimeError(
+            "找不到可用的本地端口建立端口转发（视频/控制各一个）。\n  "
+            + "\n  ".join(conflicts[-6:] or ["无可用槽位"])
+            + "\n  可用 `hdc fport ls` 查看现有规则，"
+              "或 `hdc fport rm tcp:<端口> localabstract:<名字>` 手工清理。")
 
     def setup(self):
         targets = self._run(["hdc", "list", "targets"])
@@ -130,8 +276,10 @@ class HdcSession:
         if not device_list or device_list == ["[Empty]"]:
             raise RuntimeError("没有在线设备，请先用 hdc 检查连接")
 
+        # 无论是否显式指定 -t，都解析出具体设备 ID：
+        # 端口槽位分配和转发规则归属都要靠它区分设备，否则多设备会串台。
         if self.target:
-            if self.target not in targets:
+            if self.target not in device_list:
                 raise RuntimeError(
                     f"设备 {self.target} 不在线\n"
                     f"  当前设备列表:\n    " + "\n    ".join(device_list or ["(空)"]))
@@ -141,8 +289,8 @@ class HdcSession:
                 raise RuntimeError(
                     f"检测到 {len(device_list)} 个设备，请用 -t 指定设备 ID:\n    "
                     + "\n    ".join(device_list))
-            print(f"[hdc] 使用默认设备: {device_list[0]}")
-
+            self.target = device_list[0]
+            print(f"[hdc] 使用默认设备: {self.target}")
         self._run(self._hdc_cmd("shell", f"killall {SERVER_BIN}"),
                   check=False, timeout=5)
         local_bin = find_resource(SERVER_BIN)
@@ -154,22 +302,8 @@ class HdcSession:
         self._file_pushed = True
         print(f"[hdc] 已推送 {SERVER_BIN} → {DEVICE_PATH}")
 
-        for port, sock_name in [(self.video_port, VIDEO_SOCK_NAME),
-                                 (self.ctrl_port, CTRL_SOCK_NAME)]:
-            self._run(self._hdc_cmd(
-                "fport", "rm", f"tcp:{port} localabstract:{sock_name}"
-            ), check=False, timeout=5)
-            try:
-                self._run(self._hdc_cmd(
-                    "fport", f"tcp:{port}", f"localabstract:{sock_name}"
-                ))
-            except RuntimeError as e:
-                err = str(e)
-                if "listen failed" in err or "Port listen" in err:
-                    _log(f"端口 tcp:{port} 已有转发规则，直接复用")
-                else:
-                    raise
-        self._fport_set = True
+        # 按设备分配互不冲突的本地端口，并正确清理旧规则
+        self._setup_forwards()
         print(f"[hdc] 端口转发已建立: "
               f"tcp:{self.video_port}→localabstract:{VIDEO_SOCK_NAME}, "
               f"tcp:{self.ctrl_port}→localabstract:{CTRL_SOCK_NAME}")
@@ -211,7 +345,43 @@ class HdcSession:
         else:
             print("[hdc] 警告：服务端未就绪，继续尝试...")
 
+        self._ensure_desktop_on_virtual_screen()
+
+    def _ensure_desktop_on_virtual_screen(self):
+        """无屏设备的虚拟屏上只有一张壁纸 —— 必须让桌面重建主窗口。
+
+        桌面 DisplayManager.createMainWindow() 特意跳过默认屏
+        （注释「主屏不需要创建主窗口」），所以虚拟屏建好之后桌面不会自动在
+        上面建出真正的桌面窗口，只剩 SubDisplayWallpaperPage（一张壁纸）。
+        该页面不响应触摸，看起来就像「虚拟屏无法反控」——注入其实一直是通的，
+        只是没有可交互的 UI。重启桌面即可让它在虚拟屏上建出正常桌面。
+        """
+        if not RESTART_LAUNCHER:
+            return
+        out = self._run(
+            self._hdc_cmd("shell", "hidumper -s DisplayManagerService -a '-s -a'"),
+            check=False, timeout=10)
+        if "DevEcoViewer" not in out:
+            return
+        print("[hdc] 检测到虚拟屏（无屏设备），重启桌面让它在虚拟屏上重建主窗口")
+        r = self._run(self._hdc_cmd("shell", "aa force-stop com.ohos.launcher"),
+                      check=False, timeout=10)
+        if "[Fail]" in r or "error" in r.lower():
+            print(f"[hdc] 重启桌面失败（可手工执行 "
+                  f"`hdc -t {self.target} shell \"aa force-stop com.ohos.launcher\"`）: {r}")
+        else:
+            time.sleep(2.0)
+
     def cleanup(self):
+        # 先撤端口转发：它是「切设备仍看到上一台」的直接原因，
+        # 放在最前面才能保证即使后面 killall / rm 卡住也已经切干净了。
+        for port, sock_name in list(self._forwards):
+            try:
+                self._remove_forward(port, sock_name)
+            except Exception as e:
+                print(f"[hdc] 清理端口转发 tcp:{port} 时出错（可忽略）: {e}")
+        self._forwards = []
+
         if self._server_started:
             try:
                 self._run(self._hdc_cmd(
@@ -231,21 +401,6 @@ class HdcSession:
             except Exception as e:
                 print(f"[hdc] 删除文件时出错（可忽略）: {e}")
             self._file_pushed = False
-
-        if self._fport_set:
-            try:
-                self._run(self._hdc_cmd(
-                    "fport", "rm",
-                    f"tcp:{self.video_port} localabstract:{VIDEO_SOCK_NAME}"
-                ), check=False, timeout=5)
-                self._run(self._hdc_cmd(
-                    "fport", "rm",
-                    f"tcp:{self.ctrl_port} localabstract:{CTRL_SOCK_NAME}"
-                ), check=False, timeout=5)
-                print("[hdc] 端口转发已移除")
-            except Exception as e:
-                print(f"[hdc] 清理端口转发时出错（可忽略）: {e}")
-            self._fport_set = False
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
@@ -587,10 +742,11 @@ def run(args):
         return
 
     hdc_session = HdcSession(args.target)
-    hdc_session.setup()
 
     try:
-        _run_app("127.0.0.1", LOCAL_VIDEO_PORT, LOCAL_CTRL_PORT,
+        hdc_session.setup()
+        # 使用本次会话实际分配到的端口（多设备时每个设备端口不同）
+        _run_app("127.0.0.1", hdc_session.video_port, hdc_session.ctrl_port,
                  record_path=args.record)
     finally:
         hdc_session.cleanup()
@@ -844,11 +1000,15 @@ def parse_args():
     p.add_argument("--server-args", default="", metavar="ARGS",
                    help="追加传给设备端 ohscrcpy 的参数，用于调画质，"
                         "如 --server-args \"-b 20000000 -i 500\"")
+    p.add_argument("--no-restart-launcher", action="store_true",
+                   help="检测到虚拟屏时也【不】重启桌面。默认会重启："
+                        "否则无屏设备的虚拟屏上只有一张壁纸，点了没有任何反应")
     args = p.parse_args()
-    global VERBOSE, MAX_HEIGHT, SERVER_ARGS
+    global VERBOSE, MAX_HEIGHT, SERVER_ARGS, RESTART_LAUNCHER
     VERBOSE = args.verbose
     MAX_HEIGHT = args.max_height
     SERVER_ARGS = args.server_args or ""
+    RESTART_LAUNCHER = not args.no_restart_launcher
     return args
 
 

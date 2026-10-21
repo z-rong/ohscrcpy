@@ -351,6 +351,14 @@ int main(int argc, char *argv[])
         HILOG_INFO(LOG_CORE, "屏幕采集已启动（虚拟屏直连编码器 Surface）");
     }
 
+    // 明确告诉输入服务该往哪块屏注入：无屏设备上是刚建好的默认虚拟屏，
+    // 有屏设备上就是真实默认屏。不指定时 MMI 只按「默认显示组第一个屏」推断，
+    // 多屏（物理屏 + 虚拟屏、或遗留旧虚拟屏）时会注入到别的屏上 —— 表现为
+    // 「画面能看、点按没反应」。
+    int32_t targetDisplayId = ohscrcpy::QueryDefaultDisplayId();
+    inputSrv->SetTargetDisplayId(targetDisplayId);
+    HILOG_INFO(LOG_CORE, "输入注入目标屏幕 displayId=%{public}d", targetDisplayId);
+
     // 新客户端连接时请求 IDR 帧，确保客户端能立即收到 SPS/PPS
     video->SetNewClientCallback([&capture]() {
         if (capture) { capture->RequestIDRFrame(); }

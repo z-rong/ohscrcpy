@@ -86,6 +86,15 @@ bool CreateVirtualDisplayAsDefault(int32_t width, int32_t height,
 /** 销毁本模块创建的虚拟屏（若创建过）。进程异常退出时由 DMS 兜底回收。 */
 void DestroyVirtualDisplay();
 
+/**
+ * 查询当前默认屏的逻辑 displayId（取不到返回 -1）。
+ *
+ * 输入注入要用它来显式指定 targetDisplayId：不指定时 MMI 只在「默认显示组里
+ * 取第一个屏」，一旦系统里同时存在多块屏（物理屏 + 虚拟屏、或遗留的旧虚拟屏），
+ * 注入就可能落到另一块屏上，表现为「画面能看、点按却没反应」。
+ */
+int32_t QueryDefaultDisplayId();
+
 } // namespace ohscrcpy
 
 #endif // OHSCRCPY_VIRTUAL_DISPLAY_H

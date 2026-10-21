@@ -83,6 +83,8 @@ powershell -ExecutionPolicy Bypass -File client\build_exe.ps1
 - `--direct <host> --video-port <p> --ctrl-port <p>` 可跳过 hdc 直接连接
   已就绪的服务端端口（调试用）；配合 `client/mock_device.py` 可在无真机环境下
   做端到端测试。
+- `--no-restart-launcher`：默认在检测到虚拟屏时自动重启桌面（否则虚拟屏上只剩
+  一张壁纸、点了没反应），该开关用于关掉这个行为。
 
 ## 使用方法
 
@@ -108,14 +110,24 @@ powershell -ExecutionPolicy Bypass -File client\build_exe.ps1
 ```bash
 # 1. 启动客户端（会自动推送二进制、建转发、启动服务端；服务端自动建/复用虚拟屏）
 python ohscrcpy_client.py -t <device_id>
+```
 
-# 2. 让桌面在虚拟屏上重新建窗（首次连接、或重启过服务端后执行一次）
+客户端在检测到虚拟屏后会**自动重启一次桌面**，让桌面在虚拟屏上重建主窗口；
+不想让它动桌面时加 `--no-restart-launcher`，再手工执行：
+
+```bash
 hdc -t <device_id> shell "aa force-stop com.ohos.launcher"
 ```
 
-第 2 步是必需的：桌面的 `DisplayManager.createMainWindow()` 会**特意跳过默认屏**
+这一步是必需的：桌面的 `DisplayManager.createMainWindow()` 会**特意跳过默认屏**
 （"主屏不需要创建主窗口"），所以光把虚拟屏设为默认屏，桌面不会自动在上面建窗口；
 而桌面主窗口创建时不指定 `displayId`，会落到默认屏 —— 重启桌面即可让它在虚拟屏上建窗。
+
+> **为什么「虚拟屏点了没反应」**：不重启桌面时，虚拟屏上只有桌面的
+> `SubDisplayWallpaperPage`（一张壁纸，`customMainWindow_0`），这个页面本身不响应触摸。
+> 此时输入注入其实是通的（`uitest uiInput click` / 客户端点击都会送达该窗口），
+> 只是没有可交互的 UI。重启桌面后虚拟屏上会出现完整桌面（图标 + Dock），
+> 点击图标即可正常启动应用。
 
 **已知限制**：
 - 屏名借用系统保留的 `DevEcoViewer` 通道。
@@ -251,6 +263,38 @@ python ohscrcpy_client.py -t <device_id> -v
 
 客户端会自动完成：推送二进制 → 端口转发 → 启动服务端 → 连接 → 显示画面。
 退出时自动清理（杀进程、删文件、移除转发）。
+
+### 多设备同时连接 / 切换设备
+
+本地端口**不是**按设备隔离的：`hdc` 的 `fport` 在**整台 PC 上全局绑定**
+`127.0.0.1:<port>`。所以两台设备都用 `tcp:8554` 时，第二台必然失败：
+
+```
+[Fail]TCP Port listen failed at 8554
+```
+
+因此客户端现在**按设备 ID 分配端口槽**（视频/控制成对），并把实际使用的端口打印出来：
+
+```
+[hdc] 端口转发已建立: tcp:8590→localabstract:ohscrcpy_video, tcp:8591→localabstract:ohscrcpy_ctrl
+```
+
+两台设备可以同时开两个客户端，互不影响。
+
+另外两个必须注意的 `hdc` 行为（客户端已处理，手工操作时也要小心）：
+
+1. **`hdc fport rm` 的任务串必须是两个参数**：
+   ```bash
+   hdc fport rm tcp:8554 localabstract:ohscrcpy_video     # 正确
+   hdc fport rm "tcp:8554 localabstract:ohscrcpy_video"   # 错误：ruler is not exist，规则没删掉
+   ```
+   后者会返回 `[Fail]Remove forward ruler failed, ruler is not exist`，
+   但规则其实还在 —— 于是「切换设备后连的仍是上一台」。
+   客户端现在会删完再 `fport ls` 复核，确认端口真的释放。
+2. `hdc fport ls` 里没有、但 `127.0.0.1:<port>` 仍处于 `LISTENING` 的情况确实存在
+   （hdc server 残留监听）。这时再 `fport` 同一个端口一定失败，
+   所以客户端选端口前会先做本地 bind 探测，被占用就换下一个槽，
+   绝不再「假设已有规则可复用」。彻底清掉残留只能重启 hdc server（`hdc kill`）。
 
 ### 调试：导出 H.264 码流
 

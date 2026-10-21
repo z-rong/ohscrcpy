@@ -28,6 +28,7 @@
 
 // 窗口管理（libdm，inner kit）
 #include "display_manager.h"
+#include "display.h"
 #include "dm_common.h"
 #include "screen_manager.h"
 #include "screen.h"
@@ -65,6 +66,16 @@ constexpr int kWaitDefaultDisplayIntervalMs = 100;
 
 Rosen::ScreenId g_screenId = Rosen::SCREEN_ID_INVALID;
 
+/** 当前默认显示是否就是本进程创建的虚拟屏 */
+bool IsOurScreenDefaultDisplay()
+{
+    if (g_screenId == Rosen::SCREEN_ID_INVALID) {
+        return false;
+    }
+    auto display = Rosen::DisplayManager::GetInstance().GetDefaultDisplaySync();
+    return (display != nullptr) && (display->GetScreenId() == g_screenId);
+}
+
 /** 查找已存在的同名虚拟屏（可能是上次遗留的），返回其 ScreenId 或 SCREEN_ID_INVALID */
 Rosen::ScreenId FindOurVirtualScreen()
 {
@@ -85,6 +96,16 @@ Rosen::ScreenId FindOurVirtualScreen()
 bool HasDefaultDisplay()
 {
     return Rosen::DisplayManager::GetInstance().GetDefaultDisplay() != nullptr;
+}
+
+int32_t QueryDefaultDisplayId()
+{
+    auto display = Rosen::DisplayManager::GetInstance().GetDefaultDisplaySync();
+    if (display == nullptr) {
+        HILOG_WARN(LOG_CORE, "查询默认屏失败，注入目标屏幕交给 MMI 推断");
+        return -1;
+    }
+    return static_cast<int32_t>(display->GetId());
 }
 
 bool HasRealDisplay()
@@ -114,24 +135,8 @@ bool CreateVirtualDisplayAsDefault(int32_t width, int32_t height,
         return false;
     }
 
-    Rosen::ScreenId existing = FindOurVirtualScreen();
-    if (existing != Rosen::SCREEN_ID_INVALID) {
-        // 复用已有的同名虚拟屏（通常是上次进程被强杀时留下的）。
-        // 之所以复用而不是销毁重建：AbstractScreenController::DestroyVirtualScreen 对
-        // 「默认虚拟屏」直接返回 DM_ERROR_INVALID_PARAM（"Not destroy default virtual screen"），
-        // 而 SetVirtualScreenSurface 没有创建者归属检查，可以安全地把输出目标换成
-        // 本次的编码器 Surface。
-        g_screenId = existing;
-        Rosen::DMError ret = Rosen::ScreenManager::GetInstance().SetVirtualScreenSurface(
-            g_screenId, targetSurface);
-        HILOG_WARN(LOG_CORE,
-                   "复用遗留虚拟屏 screenId=%{public}" PRIu64 "，SetVirtualScreenSurface ret=%{public}d",
-                   g_screenId, static_cast<int32_t>(ret));
-        if (ret != Rosen::DMError::DM_OK) {
-            HILOG_ERROR(LOG_CORE, "替换虚拟屏输出 Surface 失败");
-            return false;
-        }
-    } else {
+    // 新建一块虚拟屏（surface 直接作为渲染目标）
+    auto createNewScreen = [&]() -> bool {
         Rosen::VirtualScreenOption option;
         option.name_      = kVirtualScreenName;
         option.width_     = static_cast<uint32_t>(width > 0 ? width : 1920);
@@ -151,6 +156,37 @@ bool CreateVirtualDisplayAsDefault(int32_t width, int32_t height,
         HILOG_INFO(LOG_CORE,
                    "虚拟屏已创建: screenId=%{public}" PRIu64 ", %{public}ux%{public}u, name=%{public}s",
                    g_screenId, option.width_, option.height_, kVirtualScreenName);
+        return true;
+    };
+
+    Rosen::ScreenId existing = FindOurVirtualScreen();
+    if (existing != Rosen::SCREEN_ID_INVALID) {
+        // 复用已有的同名虚拟屏（通常是上次进程被强杀时留下的）。
+        // 之所以优先复用而不是销毁重建：AbstractScreenController::DestroyVirtualScreen 对
+        // 「默认虚拟屏」直接返回 DM_ERROR_INVALID_PARAM（"Not destroy default virtual screen"），
+        // 而 SetVirtualScreenSurface 没有创建者归属检查，可以安全地把输出目标换成
+        // 本次的编码器 Surface。
+        g_screenId = existing;
+        Rosen::DMError ret = Rosen::ScreenManager::GetInstance().SetVirtualScreenSurface(
+            g_screenId, targetSurface);
+        HILOG_WARN(LOG_CORE,
+                   "复用遗留虚拟屏 screenId=%{public}" PRIu64 "，SetVirtualScreenSurface ret=%{public}d",
+                   g_screenId, static_cast<int32_t>(ret));
+        if (ret != Rosen::DMError::DM_OK) {
+            // 遗留屏已经和 RS 侧脱节（例如上次进程被强杀），替换 Surface 会失败。
+            // 此时销毁它再重建，避免工具直接启动失败。
+            HILOG_WARN(LOG_CORE, "替换虚拟屏输出 Surface 失败，销毁遗留屏后重建");
+            Rosen::DMError dret = Rosen::ScreenManager::GetInstance().DestroyVirtualScreen(g_screenId);
+            HILOG_WARN(LOG_CORE, "销毁遗留虚拟屏 %{public}" PRIu64 " ret=%{public}d",
+                       g_screenId, static_cast<int32_t>(dret));
+            if (dret != Rosen::DMError::DM_OK || !createNewScreen()) {
+                HILOG_ERROR(LOG_CORE, "遗留虚拟屏无法复用也无法重建");
+                g_screenId = Rosen::SCREEN_ID_INVALID;
+                return false;
+            }
+        }
+    } else if (!createNewScreen()) {
+        return false;
     }
 
     // 运行时可改密度：VPR = dpi/160。这是清晰度的关键开关 —— VPR 1.5 等于让 UI 按
@@ -168,8 +204,11 @@ bool CreateVirtualDisplayAsDefault(int32_t width, int32_t height,
 
     // 设为默认屏：DMS 会写入 defaultRsScreenId_ 并 onConnect_，
     // 之后 GetDefaultDisplaySync() 才能返回该屏，新建窗口也才会归属到它。
-    // 已经是默认屏时（复用遗留屏的情形）无需重复设置。
-    if (!HasDefaultDisplay()) {
+    // 这里不能只看「有没有默认屏」：如果系统里已经存在另一块默认屏
+    //（物理屏、或上次遗留的旧虚拟屏），只复用同名屏而不把它重新设为默认，
+    // 就会出现「画面能看、反控却点到别的屏上」——必须确保默认屏就是本屏。
+    bool isOurScreenDefault = IsOurScreenDefaultDisplay();
+    if (!isOurScreenDefault) {
         bool ok = Rosen::DisplayManager::GetInstance().SetVirtualScreenAsDefault(g_screenId);
         HILOG_INFO(LOG_CORE, "SetVirtualScreenAsDefault(%{public}" PRIu64 ") = %{public}d",
                    g_screenId, static_cast<int32_t>(ok));
@@ -177,12 +216,12 @@ bool CreateVirtualDisplayAsDefault(int32_t width, int32_t height,
             return false;
         }
     } else {
-        HILOG_INFO(LOG_CORE, "默认屏已存在（复用遗留虚拟屏），无需重复设置");
+        HILOG_INFO(LOG_CORE, "本虚拟屏已是默认屏，无需重复设置");
     }
 
     // WMS 侧还要走 CheckIfNeedConnectScreen() 白名单、再建立 AbstractDisplay，给点时间生效
     for (int i = 0; i < kWaitDefaultDisplayRetries; i++) {
-        if (HasDefaultDisplay()) {
+        if (IsOurScreenDefaultDisplay()) {
             HILOG_INFO(LOG_CORE, "默认屏已就绪（第 %{public}d 次探测）", i + 1);
             return true;
         }

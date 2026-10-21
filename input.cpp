@@ -184,6 +184,25 @@ void InputServer::Stop()
     HILOG_INFO(LOG_CORE, "输入控制服务已停止");
 }
 
+void InputServer::SetTargetDisplayId(int32_t displayId)
+{
+    // 只在运行期被调用一次（虚拟屏建好之后），写 int32 本身是原子的
+    targetDisplayId_.store(displayId);
+    HILOG_INFO(LOG_CORE, "注入目标屏幕 displayId=%{public}d（-1 表示由 MMI 推断）", displayId);
+}
+
+void InputServer::ApplyTargetDisplay(InputEvent *event)
+{
+    if (event == nullptr) {
+        return;
+    }
+    int32_t displayId = targetDisplayId_.load();
+    if (displayId >= 0) {
+        // 显式指定目标屏，避免多屏（物理屏/遗留虚拟屏）时注入落到别的屏上
+        event->SetTargetDisplayId(displayId);
+    }
+}
+
 // ─── AcceptLoop ───────────────────────────────────────────────────────────────
 
 void InputServer::AcceptLoop()
@@ -357,6 +376,7 @@ void InputServer::InjectMouseMove(int32_t x, int32_t y)
     event->SetPointerAction(PointerEvent::POINTER_ACTION_MOVE);
     event->SetSourceType(PointerEvent::SOURCE_TYPE_TOUCHSCREEN);
     event->SetActionTime(NowUs());
+    ApplyTargetDisplay(event.get());
 
     InputManager::GetInstance()->SimulateInputEvent(event);
 }
@@ -389,6 +409,7 @@ void InputServer::InjectMouseButton(int32_t x, int32_t y, uint8_t button, int32_
     event->SetPointerAction(touchAction);
     event->SetSourceType(PointerEvent::SOURCE_TYPE_TOUCHSCREEN);
     event->SetActionTime(NowUs());
+    ApplyTargetDisplay(event.get());
     HILOG_DEBUG(LOG_CORE, "PointerEvent built, calling SimulateInputEvent");
 
     InputManager::GetInstance()->SimulateInputEvent(event);
@@ -412,6 +433,7 @@ void InputServer::InjectMouseScroll(int32_t x, int32_t y, int32_t delta)
     event->SetSourceType(PointerEvent::SOURCE_TYPE_MOUSE);
     event->SetAxisValue(PointerEvent::AXIS_TYPE_SCROLL_VERTICAL, static_cast<double>(delta));
     event->SetActionTime(NowUs());
+    ApplyTargetDisplay(event.get());
 
     InputManager::GetInstance()->SimulateInputEvent(event);
 }
@@ -432,6 +454,7 @@ void InputServer::InjectTouch(int32_t action, uint8_t fingerId, int32_t x, int32
     event->SetPointerAction(action);
     event->SetSourceType(PointerEvent::SOURCE_TYPE_TOUCHSCREEN);
     event->SetActionTime(NowUs());
+    ApplyTargetDisplay(event.get());
 
     InputManager::GetInstance()->SimulateInputEvent(event);
 }
@@ -449,6 +472,7 @@ void InputServer::InjectKey(int32_t action, int32_t keyCode)
     event->SetKeyAction(action);
     event->AddKeyItem(item);
     event->SetKeyCode(keyCode);
+    ApplyTargetDisplay(event.get());
 
     InputManager::GetInstance()->SimulateInputEvent(event);
 }
