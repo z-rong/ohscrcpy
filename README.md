@@ -83,8 +83,9 @@ powershell -ExecutionPolicy Bypass -File client\build_exe.ps1
 - `--direct <host> --video-port <p> --ctrl-port <p>` 可跳过 hdc 直接连接
   已就绪的服务端端口（调试用）；配合 `client/mock_device.py` 可在无真机环境下
   做端到端测试。
-- `--no-restart-launcher`：默认在检测到虚拟屏时自动重启桌面（否则虚拟屏上只剩
-  一张壁纸、点了没反应），该开关用于关掉这个行为。
+- `--no-ui-restart`（旧名 `--no-restart-launcher`）：默认在检测到虚拟屏时自动重启
+  SystemUI 与桌面并解锁（否则状态栏/导航栏一直是 0x0、桌面上只剩一张壁纸，
+  点了没反应），该开关用于关掉这个行为。
 
 ## 使用方法
 
@@ -112,22 +113,40 @@ powershell -ExecutionPolicy Bypass -File client\build_exe.ps1
 python ohscrcpy_client.py -t <device_id>
 ```
 
-客户端在检测到虚拟屏后会**自动重启一次桌面**，让桌面在虚拟屏上重建主窗口；
-不想让它动桌面时加 `--no-restart-launcher`，再手工执行：
+客户端在检测到虚拟屏后会**自动补齐 UI**（SystemUI → 桌面 → 上滑解锁）；
+不想让它动设备 UI 时加 `--no-ui-restart`（旧名 `--no-restart-launcher` 仍可用），再手工执行：
 
 ```bash
-hdc -t <device_id> shell "aa force-stop com.ohos.launcher"
+hdc -t <device_id> shell "killall com.ohos.systemui"              # 状态栏/导航栏 0x0
+hdc -t <device_id> shell "aa force-stop com.ohos.launcher"        # 桌面只建了壁纸窗口
+# 然后手工在画面上从底部上滑一次解锁
 ```
 
-这一步是必需的：桌面的 `DisplayManager.createMainWindow()` 会**特意跳过默认屏**
-（"主屏不需要创建主窗口"），所以光把虚拟屏设为默认屏，桌面不会自动在上面建窗口；
-而桌面主窗口创建时不指定 `displayId`，会落到默认屏 —— 重启桌面即可让它在虚拟屏上建窗。
+**为什么必须补这一步：**
 
-> **为什么「虚拟屏点了没反应」**：不重启桌面时，虚拟屏上只有桌面的
-> `SubDisplayWallpaperPage`（一张壁纸，`customMainWindow_0`），这个页面本身不响应触摸。
-> 此时输入注入其实是通的（`uitest uiInput click` / 客户端点击都会送达该窗口），
-> 只是没有可交互的 UI。重启桌面后虚拟屏上会出现完整桌面（图标 + Dock），
-> 点击图标即可正常启动应用。
+- **SystemUI（状态栏 / 导航栏 / 锁屏）**：SystemUI 在开机时初始化
+  `NavBarConfiguration.initNavBarConfiguration()`：
+  ```ts
+  display.getDefaultDisplay().then(dis => { maxWidth = dis.width; ... })
+  ```
+  此刻无屏设备上系统里一块屏都没有 → 该 Promise 失败 → `maxWidth/maxHeight`
+  保持 `undefined` → 窗口按 **0×0** 创建。而 SystemUI 只注册了
+  `display.on('change')`（且仅当「方向变化」时才 `resetSizeWindow`），
+  虚拟屏是 `display.on('add')` 事件，**永远不会触发重排** —— 于是
+  `SystemUi_StatusBar / NavigationBar / PrivacyIndicator / ScreenLockWindow`
+  一直是 `[0,0,0,0]`，看起来就是「SystemUI 没起来」。
+  重启 SystemUI，它会按真实分辨率重建窗口（1920×75 等）。
+- **桌面**：`DisplayManager.createMainWindow()` 特意跳过默认屏
+  （"主屏不需要创建主窗口"），所以光把虚拟屏设为默认屏，桌面不会在上面建窗口；
+  它只在启动时按 `display.getDefaultDisplaySync().id` 判断一次「谁是主屏」，
+  之后不再复查。重启桌面即可让它在虚拟屏上建出正常桌面。
+- **解锁**：SystemUI 起来后 keyguard 才真正生效（`ScreenLockWindow` 变成全屏），
+  会盖住桌面，需要一次从底部上滑解锁。
+
+> 注意顺序：服务端的 abstract socket **先于**虚拟屏创建，客户端必须**等虚拟屏
+> 真正出现**（轮询 `hidumper -s DisplayManagerService -a '-s -a'` 里的
+> `DevEcoViewer` + 默认屏）再去重启 SystemUI，否则 SystemUI 又会在「没有屏」的
+> 状态下重启一次，窗口依旧是 0×0。
 
 **已知限制**：
 - 屏名借用系统保留的 `DevEcoViewer` 通道。

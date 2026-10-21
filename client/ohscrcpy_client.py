@@ -20,6 +20,7 @@ ohscrcpy_client_opencv.py — OpenHarmony 投屏客户端（OpenCV 版）
 
 import argparse
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -59,9 +60,10 @@ VERBOSE = False
 MAX_HEIGHT = 0
 # 追加传给设备端 ohscrcpy 的参数（例如 "-b 20000000 -i 500"），用于调画质
 SERVER_ARGS = ""
-# 检测到虚拟屏（无屏设备）时，是否自动重启桌面让它在虚拟屏上重建主窗口。
-# 关掉它就是旧行为：虚拟屏上只有一张壁纸，点了没有任何反应。
-RESTART_LAUNCHER = True
+# 检测到虚拟屏（无屏设备）时，是否自动补齐 SystemUI / 桌面 / 解锁。
+# 关掉它就是旧行为：状态栏、导航栏一直是 0x0（等于 SystemUI 没起来），
+# 桌面上只有一张壁纸，点了没有任何反应。
+RESTART_UI = True
 
 def _log(msg):
     if VERBOSE:
@@ -345,32 +347,156 @@ class HdcSession:
         else:
             print("[hdc] 警告：服务端未就绪，继续尝试...")
 
-        self._ensure_desktop_on_virtual_screen()
+        self._ensure_ui_ready_on_virtual_screen()
 
-    def _ensure_desktop_on_virtual_screen(self):
-        """无屏设备的虚拟屏上只有一张壁纸 —— 必须让桌面重建主窗口。
+    # ── 虚拟屏启动后补齐 UI（SystemUI / 桌面 / 解锁）─────────────────────
+    def _dump_windows(self):
+        return self._run(
+            self._hdc_cmd("shell", "hidumper -s WindowManagerService -a '-a'"),
+            check=False, timeout=10)
 
-        桌面 DisplayManager.createMainWindow() 特意跳过默认屏
-        （注释「主屏不需要创建主窗口」），所以虚拟屏建好之后桌面不会自动在
-        上面建出真正的桌面窗口，只剩 SubDisplayWallpaperPage（一张壁纸）。
-        该页面不响应触摸，看起来就像「虚拟屏无法反控」——注入其实一直是通的，
-        只是没有可交互的 UI。重启桌面即可让它在虚拟屏上建出正常桌面。
-        """
-        if not RESTART_LAUNCHER:
-            return
+    @staticmethod
+    def _window_size(dump, name):
+        """从 WMS dump 里取某个窗口的宽高；找不到返回 None"""
+        for line in dump.splitlines():
+            if not line.strip().startswith(name):
+                continue
+            m = re.search(r"\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]\s*$", line)
+            if m:
+                return int(m.group(3)), int(m.group(4))
+        return None
+
+    def _display_size(self):
+        """从 DMS dump 里取默认屏分辨率（宽, 高）；取不到返回 None"""
         out = self._run(
+            self._hdc_cmd("shell", "hidumper -s DisplayManagerService -a '-d -a'"),
+            check=False, timeout=10)
+        m = re.search(r"\[\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*\]", out)
+        if not m:
+            return None
+        return int(m.group(3)), int(m.group(4))
+
+    def _screens_dump(self):
+        return self._run(
             self._hdc_cmd("shell", "hidumper -s DisplayManagerService -a '-s -a'"),
             check=False, timeout=10)
-        if "DevEcoViewer" not in out:
-            return
-        print("[hdc] 检测到虚拟屏（无屏设备），重启桌面让它在虚拟屏上重建主窗口")
-        r = self._run(self._hdc_cmd("shell", "aa force-stop com.ohos.launcher"),
-                      check=False, timeout=10)
-        if "[Fail]" in r or "error" in r.lower():
-            print(f"[hdc] 重启桌面失败（可手工执行 "
-                  f"`hdc -t {self.target} shell \"aa force-stop com.ohos.launcher\"`）: {r}")
+
+    def _has_display(self):
+        out = self._run(
+            self._hdc_cmd("shell", "hidumper -s DisplayManagerService -a '-d -a'"),
+            check=False, timeout=10)
+        return bool(re.search(r"\[\s*\d+\s+\d+\s+\d+\s+\d+\s*\]", out))
+
+    def _wait_virtual_display(self, timeout=20.0):
+        """等服务端把虚拟屏真正建出来。
+
+        服务端的 abstract socket **先于**虚拟屏创建，所以 `_wait_server_ready()`
+        返回时虚拟屏往往还不存在；此时若立刻重启 SystemUI，它依然在「没有屏」的
+        状态下启动，窗口还是 0x0 —— 这就是手动验证时「SystemUI 没起来」的原因。
+        """
+        deadline = time.time() + timeout
+        seen_screen = False
+        while time.time() < deadline:
+            dm = self._screens_dump()
+            if "DevEcoViewer" in dm:
+                seen_screen = True
+                # 屏幕出现后再确认默认屏已生效
+                if self._has_display():
+                    return True
+            elif self._has_display() and not seen_screen:
+                # 系统里已有显示但不含我们的虚拟屏 —— 有真实屏的设备，不需要处理
+                return False
+            time.sleep(0.8)
+        if seen_screen:
+            print("[hdc] 警告：虚拟屏已出现但默认屏迟迟未生效，跳过 UI 重启")
         else:
+            print("[hdc] 等待虚拟屏超时（若设备有真实屏则属正常），跳过 UI 重启")
+        return False
+
+    def _is_locked(self):
+        """是否处于锁屏态。
+
+        不要用 WMS dump 里的 ScreenLockWindow 判断：该窗口在「熄屏但未锁」等状态下
+        仍会留在窗口列表里（实测会出现「桌面明明可见却报锁屏」）。以 ScreenlockService
+        的 screenLocked 字段为准。
+        """
+        out = self._run(
+            self._hdc_cmd("shell", 'hidumper -s ScreenlockService -a "-all"'),
+            check=False, timeout=10)
+        m = re.search(r"screenLocked\s+(true|false)", out)
+        return bool(m and m.group(1) == "true")
+
+    def _ensure_ui_ready_on_virtual_screen(self):
+        """无屏设备：虚拟屏是后加的，SystemUI/桌面都比它先启动，需要补三件事。
+
+        ── 1. SystemUI（状态栏 / 导航栏 / 锁屏）────────────────────────────
+        SystemUI 开机时（此刻系统里一块屏都没有）执行
+        NavBarConfiguration.initNavBarConfiguration()：
+            display.getDefaultDisplay().then(dis => { maxWidth = dis.width; ... })
+        取不到默认屏 → maxWidth/maxHeight 一直是 undefined → 窗口按 0x0 创建。
+        之后它只注册了 display.on('change')（且仅当「方向变化」时才重排），
+        而虚拟屏是 display.on('add') 事件，永远不会触发重排 —— 于是
+        SystemUi_StatusBar / NavigationBar / PrivacyIndicator / ScreenLockWindow
+        一直是 [0,0,0,0]，表现为「SystemUI 没起来」。重启 SystemUI 让它按真实
+        分辨率重建窗口即可。
+
+        ── 2. 桌面 ─────────────────────────────────────────────────────────
+        桌面 DisplayManager.createMainWindow() 特意跳过默认屏
+        （注释「主屏不需要创建主窗口」），所以虚拟屏建好后桌面不会在上面建出
+        真正的桌面窗口，只剩 SubDisplayWallpaperPage（一张壁纸，不响应触摸）。
+
+        ── 3. 解锁 ─────────────────────────────────────────────────────────
+        SystemUI 起来后 keyguard 才真正生效，会盖住桌面，需要上滑解锁。
+        """
+        if not RESTART_UI:
+            return
+        if not self._wait_virtual_display():
+            return
+
+        # 1) SystemUI：状态栏/导航栏还是 0x0（或不存在）就重启它
+        wm = self._dump_windows()
+        status_bar = self._window_size(wm, "SystemUi_StatusBar")
+        nav_bar = self._window_size(wm, "SystemUi_NavigationB")
+        if (status_bar in (None, (0, 0))) or (nav_bar in (None, (0, 0))):
+            print(f"[hdc] SystemUI 窗口为 0x0（status={status_bar} nav={nav_bar}）："
+                  f"虚拟屏晚于 SystemUI 启动，重启 SystemUI 让它按真实分辨率重建")
+            self._run(self._hdc_cmd("shell", "killall com.ohos.systemui"),
+                      check=False, timeout=10)
+            time.sleep(3.5)
+            wm = self._dump_windows()
+            print(f"[hdc] 重启后 SystemUI: status={self._window_size(wm, 'SystemUi_StatusBar')} "
+                  f"nav={self._window_size(wm, 'SystemUi_NavigationB')}")
+
+        # 2) 桌面：只有在主窗口确实没建好时才重启（有真实屏的设备不会进这里）
+        entry = self._window_size(wm, "EntryView")
+        if entry in (None, (0, 0)):
+            print(f"[hdc] 桌面主窗口 EntryView={entry}，重启桌面让它在虚拟屏上重建")
+            for attempt in (1, 2):
+                r = self._run(self._hdc_cmd("shell", "aa force-stop com.ohos.launcher"),
+                              check=False, timeout=10)
+                if "[Fail]" not in r and "error" not in r.lower():
+                    break
+                print(f"[hdc] 重启桌面第 {attempt} 次失败（系统可能还没起完），1s 后重试: {r.splitlines()[0] if r else ''}")
+                time.sleep(1.0)
             time.sleep(2.0)
+            wm = self._dump_windows()
+
+        # 3) 解锁：SystemUI 重启后 keyguard 才真正生效，会盖住桌面，需要上滑解锁
+        if self._is_locked():
+            size = self._display_size()
+            if size is None:
+                print("[hdc] 检测到锁屏，但取不到分辨率，请手工上滑解锁")
+                return
+            w, h = size
+            print(f"[hdc] 检测到锁屏（{w}x{h}），注入一次上滑解锁")
+            try:
+                ctrl = CtrlClient("127.0.0.1", self.ctrl_port)
+                ctrl.swipe(w // 2, int(h * 0.85), w // 2, int(h * 0.15),
+                           duration=0.18, steps=8)
+                ctrl.close()
+                time.sleep(1.0)
+            except OSError as e:
+                print(f"[hdc] 解锁注入失败（可忽略，手工上滑即可）: {e}")
 
     def cleanup(self):
         # 先撤端口转发：它是「切设备仍看到上一台」的直接原因，
@@ -1000,15 +1126,17 @@ def parse_args():
     p.add_argument("--server-args", default="", metavar="ARGS",
                    help="追加传给设备端 ohscrcpy 的参数，用于调画质，"
                         "如 --server-args \"-b 20000000 -i 500\"")
-    p.add_argument("--no-restart-launcher", action="store_true",
-                   help="检测到虚拟屏时也【不】重启桌面。默认会重启："
-                        "否则无屏设备的虚拟屏上只有一张壁纸，点了没有任何反应")
+    p.add_argument("--no-ui-restart", "--no-restart-launcher",
+                   dest="no_ui_restart", action="store_true",
+                   help="检测到虚拟屏时也【不】自动重启 SystemUI/桌面。默认会重启："
+                        "否则无屏设备上状态栏/导航栏一直是 0x0（SystemUI 等于没起来），"
+                        "桌面上也只有一张壁纸，点了没有任何反应")
     args = p.parse_args()
-    global VERBOSE, MAX_HEIGHT, SERVER_ARGS, RESTART_LAUNCHER
+    global VERBOSE, MAX_HEIGHT, SERVER_ARGS, RESTART_UI
     VERBOSE = args.verbose
     MAX_HEIGHT = args.max_height
     SERVER_ARGS = args.server_args or ""
-    RESTART_LAUNCHER = not args.no_restart_launcher
+    RESTART_UI = not args.no_ui_restart
     return args
 
 
