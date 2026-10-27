@@ -18,8 +18,10 @@
  * @brief TCP H.264 NALU 视频流服务器
  *
  * 监听 TCP 端口或 Unix Domain Socket，将 H.264 NALU 按下方帧协议推送给所有连接的客户端。
- * 帧协议（小端序）：magic(4) + flags(1) + pts(8) + size(4) + width(4) + height(4) + data
+ * 帧协议（小端序）：magic(4) + flags(1) + pts(8) + size(4) + width(4) + height(4)
+ *                   + rotation(4) + data
  *   flags bit0: isKey
+ *   rotation: 画面相对正立方向的旋转角（0/90/180/270），客户端据此转正显示
  */
 
 #include "server.h"
@@ -185,14 +187,15 @@ void Server::AcceptLoop()
     }
 }
 
-// NALU 帧头结构（小端序，共 25 字节）
+// NALU 帧头结构（小端序，共 29 字节）
 struct NaluHeader {
-    uint32_t magic;  // 0x4F485343 ("OHSC")
-    uint8_t  flags;  // bit0 = isKey
-    int64_t  pts;    // 微秒
-    int32_t  size;   // NALU 数据字节数
-    int32_t  width;  // 视频宽度（像素）
-    int32_t  height; // 视频高度（像素）
+    uint32_t magic;   // 0x4F485343 ("OHSC")
+    uint8_t  flags;   // bit0 = isKey
+    int64_t  pts;     // 微秒
+    int32_t  size;    // NALU 数据字节数
+    int32_t  width;   // 视频宽度（像素，编码帧方向）
+    int32_t  height;  // 视频高度（像素，编码帧方向）
+    int32_t  rotation; // 画面相对正立方向的旋转角（0/90/180/270）
 } __attribute__((packed));
 
 // 辅助：从 Annex-B NALU 数据中解析 NALU type（跳过起始码）
@@ -258,6 +261,7 @@ void Server::PushNalu(const uint8_t *data, int32_t size, int64_t pts, bool isKey
     hdr.size   = size;
     hdr.width  = width_;
     hdr.height = height_;
+    hdr.rotation = rotation_;
 
     // IDR 帧缓存（含帧头），新客户端连接时立即补发
     if (isKey) {
@@ -295,6 +299,7 @@ void Server::PushNalu(const uint8_t *data, int32_t size, int64_t pts, bool isKey
                 spsHdr.size   = static_cast<int32_t>(sps.size());
                 spsHdr.width  = width_;
                 spsHdr.height = height_;
+                spsHdr.rotation = rotation_;
                 ok = SendFrame(fd, spsHdr, sps.data(), static_cast<int32_t>(sps.size()));
                 HILOG_INFO(LOG_CORE, "pending升级: 发送 SPS size=%{public}zu ok=%{public}d fd=%{public}d",
                            sps.size(), ok ? 1 : 0, fd);
@@ -309,6 +314,7 @@ void Server::PushNalu(const uint8_t *data, int32_t size, int64_t pts, bool isKey
                 ppsHdr.size   = static_cast<int32_t>(pps.size());
                 ppsHdr.width  = width_;
                 ppsHdr.height = height_;
+                ppsHdr.rotation = rotation_;
                 ok = SendFrame(fd, ppsHdr, pps.data(), static_cast<int32_t>(pps.size()));
                 HILOG_INFO(LOG_CORE, "pending升级: 发送 PPS size=%{public}zu ok=%{public}d fd=%{public}d",
                            pps.size(), ok ? 1 : 0, fd);

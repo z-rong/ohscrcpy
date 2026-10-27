@@ -51,13 +51,16 @@ namespace ohscrcpy {
  *      配合 hdc fport localabstract 使用，绕过 TCP 协议栈，延迟更低
  *
  * 帧协议（小端序）：
- *   [magic:4]   固定 0x4F485343 ("OHSC")
- *   [flags:1]   bit0 = isKey（关键帧标志）
- *   [pts:8]     时间戳（微秒，int64）
- *   [size:4]    NALU 数据字节数
- *   [width:4]   视频宽度（像素）
- *   [height:4]  视频高度（像素）
- *   [data]      H.264 NALU 数据
+ *   [magic:4]     固定 0x4F485343 ("OHSC")
+ *   [flags:1]     bit0 = isKey（关键帧标志）
+ *   [pts:8]       时间戳（微秒，int64）
+ *   [size:4]      NALU 数据字节数
+ *   [width:4]     视频宽度（像素，编码帧方向）
+ *   [height:4]    视频高度（像素，编码帧方向）
+ *   [rotation:4]  画面相对正立方向的旋转角（0/90/180/270）。
+ *                 竖屏物理面板当横屏用的设备（cvt 等）按物理面板方向编码，
+ *                 帧内容是旋转过的，客户端按该角度转正显示
+ *   [data]        H.264 NALU 数据
  */
 class Server {
 public:
@@ -89,6 +92,9 @@ public:
     /** 更新视频分辨率（每帧帧头携带，客户端自动适配窗口大小）*/
     void SetResolution(int32_t width, int32_t height) { width_ = width; height_ = height; }
 
+    /** 设置画面旋转角度（0/90/180/270），随每帧帧头下发给客户端 */
+    void SetRotation(int32_t rotation) { rotation_ = rotation; }
+
     /**
      * @brief 设置新客户端连接回调，用于触发 IDR 帧请求
      * 每次有新客户端成功连接时调用一次 cb()
@@ -114,7 +120,7 @@ private:
 
     // 缓存最近一个完整的 IDR 帧（含帧头），新客户端连接时立即补发
     struct CachedFrame {
-        std::vector<uint8_t> hdr;   // 25 字节 NaluHeader
+        std::vector<uint8_t> hdr;   // NaluHeader（29 字节）
         std::vector<uint8_t> data;  // NALU 数据
     };
     std::mutex              idrMutex_;
@@ -127,6 +133,7 @@ private:
 
     int32_t  width_  = 0;  // 视频宽度，随每帧帧头下发
     int32_t  height_ = 0;  // 视频高度，随每帧帧头下发
+    int32_t  rotation_ = 0; // 画面旋转角（0/90/180/270），随每帧帧头下发
 
     static constexpr uint32_t kMagic = 0x4F485343u; // "OHSC"
 };

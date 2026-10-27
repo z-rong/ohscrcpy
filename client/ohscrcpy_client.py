@@ -34,7 +34,7 @@ import pygame
 
 # ── 协议常量 ──────────────────────────────────────────────────────────────────
 FRAME_MAGIC       = 0x4F485343   # "OHSC"
-HEADER_SIZE       = 25           # magic(4)+flags(1)+pts(8)+size(4)+width(4)+height(4)
+HEADER_SIZE       = 29           # magic(4)+flags(1)+pts(8)+size(4)+width(4)+height(4)+rotation(4)
 NALU_FLAG_KEY     = 0x01
 
 MSG_MOUSE_MOVE    = 0x01
@@ -544,6 +544,25 @@ class HdcSession:
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
+def enable_windows_high_dpi():
+    """Windows 高分屏缩放（如 150%）下让窗口按【物理像素】渲染。
+
+    默认 system DPI aware 时，SDL 窗口按逻辑像素（如 1280x800）建、再被系统
+    放大 1.5 倍显示，画面整体发虚；设为 per-monitor aware 后 SDL 直接拿到
+    物理分辨率，同样的窗口占屏比例能多出 1.5x 的真实像素。必须在
+    pygame.init() 之前调用。其他平台为空操作。"""
+    if os.name != "nt":
+        return
+    import ctypes
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+
 def recv_exact(sock, n):
     buf = bytearray(n)
     view = memoryview(buf)
@@ -556,13 +575,14 @@ def recv_exact(sock, n):
     return bytes(buf)
 
 def parse_nalu_header(hdr):
-    magic  = struct.unpack_from("<I", hdr, 0)[0]
-    flags  = hdr[4]
-    pts    = struct.unpack_from("<q", hdr, 5)[0]
-    size   = struct.unpack_from("<i", hdr, 13)[0]
-    width  = struct.unpack_from("<i", hdr, 17)[0]
-    height = struct.unpack_from("<i", hdr, 21)[0]
-    return magic, flags, pts, size, width, height
+    magic    = struct.unpack_from("<I", hdr, 0)[0]
+    flags    = hdr[4]
+    pts      = struct.unpack_from("<q", hdr, 5)[0]
+    size     = struct.unpack_from("<i", hdr, 13)[0]
+    width    = struct.unpack_from("<i", hdr, 17)[0]
+    height   = struct.unpack_from("<i", hdr, 21)[0]
+    rotation = struct.unpack_from("<i", hdr, 25)[0]
+    return magic, flags, pts, size, width, height, rotation
 
 
 # ── 控制连接 ──────────────────────────────────────────────────────────────────
@@ -634,6 +654,7 @@ class NaluRelay:
         self._ffmpeg = None
         self._dev_width = 0
         self._dev_height = 0
+        self._rotation = 0    # 画面相对正立方向的旋转角（0/90/180/270）
         self._out_width = 0    # ffmpeg 输出分辨率（0=不缩放）
         self._out_height = 0
         self._sock = None
@@ -673,12 +694,17 @@ class NaluRelay:
                 pass
 
     def get_resolution(self):
-        """等待并返回设备分辨率 (width, height)"""
+        """等待并返回编码帧分辨率 (width, height)；注意旋转屏设备的显示尺寸
+        需按 get_rotation() 宽高互换"""
         for _ in range(100):
             if self._dev_width > 0 and self._dev_height > 0:
                 return self._dev_width, self._dev_height
             time.sleep(0.1)
         return 1200, 1920  # 默认
+
+    def get_rotation(self):
+        """画面相对正立方向的旋转角（0/90/180/270），来自帧头"""
+        return self._rotation
 
     def wait_ffmpeg(self, timeout=10.0):
         """等待 ffmpeg 启动完成，返回 stdout（可读帧数据），超时返回 None"""
@@ -747,7 +773,7 @@ class NaluRelay:
 
                 # 读第一个 NALU 获取分辨率
                 hdr = recv_exact(sock, HEADER_SIZE)
-                magic, flags, pts, size, dev_w, dev_h = parse_nalu_header(hdr)
+                magic, flags, pts, size, dev_w, dev_h, rotation = parse_nalu_header(hdr)
                 if magic != FRAME_MAGIC:
                     print(f"[video] magic 错误: 0x{magic:08X}，重连")
                     sock.close()
@@ -756,8 +782,10 @@ class NaluRelay:
 
                 self._dev_width = dev_w
                 self._dev_height = dev_h
+                self._rotation = rotation if rotation in (0, 90, 180, 270) else 0
                 self._first_data.set()
-                print(f"[video] 设备分辨率 {dev_w}x{dev_h}")
+                rot_str = f" rotation={self._rotation}" if self._rotation else ""
+                print(f"[video] 编码分辨率 {dev_w}x{dev_h}{rot_str}")
 
                 # 等待主线程设好输出尺寸（win_w x win_h）
                 self._out_size_ready.wait(timeout=10.0)
@@ -805,7 +833,7 @@ class NaluRelay:
                         print(f"[video] 断开: {e}")
                         break
 
-                    magic, flags, pts, size, dev_w, dev_h = parse_nalu_header(hdr)
+                    magic, flags, pts, size, dev_w, dev_h, rotation = parse_nalu_header(hdr)
                     if magic != FRAME_MAGIC or size <= 0 or size > 8 * 1024 * 1024:
                         print(f"[video] NALU 异常，重连")
                         break
@@ -833,9 +861,10 @@ class NaluRelay:
 
                     nalu_count += 1
                     is_key = bool(flags & NALU_FLAG_KEY)
-                    # 前10帧全部打印，之后每30帧打印一次，帮助诊断 size 分布
+                    # NALU 流水（每30帧一条）只在 verbose/debug 模式打印，
+                    # 平时不刷屏；出现断流/异常时用 -v/--debug 查看
                     if nalu_count <= 10 or nalu_count % 30 == 0:
-                        print(f"[video] NALU #{nalu_count} size={size} key={is_key} pts={pts}")
+                        _log(f"[video] NALU #{nalu_count} size={size} key={is_key} pts={pts}")
 
             except OSError as e:
                 if self._running:
@@ -894,6 +923,9 @@ def run(args):
 
 def _run_app(host, video_port, ctrl_port, record_path=None):
     """OpenCV 显示 + 输入控制主循环"""
+    # Windows 缩放显示下按物理像素渲染（发虚的常见根源），须在 pygame.init 前
+    enable_windows_high_dpi()
+
     # 连接控制端口
     ctrl = None
     try:
@@ -919,7 +951,19 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
 
     # 等待分辨率
     print("[main] 等待设备分辨率...")
-    dev_w, dev_h = relay.get_resolution()
+    coded_w, coded_h = relay.get_resolution()
+    rotation = relay.get_rotation()
+    # 编码帧方向（coded）与显示/逻辑方向（dev）可能不同：cvt 等竖屏物理面板当
+    # 横屏用的设备按物理面板方向编码（如 1200x1920），画面相对正立方向旋转了
+    # rotation 度；转正后宽高互换，且恰好等于设备逻辑分辨率（如 1920x1200），
+    # 所以反控坐标直接按 dev_w/dev_h 映射即可，无需再做旋转变换。
+    if rotation in (90, 270):
+        dev_w, dev_h = coded_h, coded_w
+    else:
+        dev_w, dev_h = coded_w, coded_h
+        rotation = 0
+    # np.rot90 的次数：转正画面。rotation=270 → 逆时针 90°（k=1），以此类推
+    rot_k = (4 - rotation // 90) % 4
 
     # 计算窗口初始尺寸：默认按设备原始分辨率 1:1（最清晰），--max-height 可限制
     max_h = MAX_HEIGHT
@@ -983,10 +1027,10 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
             dx, dy = px, py
         return max(0, min(dev_w - 1, dx)), max(0, min(dev_h - 1, dy))
 
-    print(f"[main] 设备 {dev_w}x{dev_h}，窗口 {win_w}x{win_h}")
+    print(f"[main] 设备 {dev_w}x{dev_h}（编码 {coded_w}x{coded_h} rotation={rotation}），窗口 {win_w}x{win_h}")
     print("[main] 鼠标点击/拖动=触摸注入  Esc=退出  h=Home")
 
-    frame_size = dev_w * dev_h * 3  # BGR = 3 bytes/pixel，ffmpeg 输出原始分辨率
+    frame_size = coded_w * coded_h * 3  # BGR = 3 bytes/pixel，ffmpeg 按编码帧方向输出
 
     # ── 读帧线程：阻塞 read 放到后台，主线程只做渲染 ──────────────────────
     _stop_event = threading.Event()
@@ -1020,7 +1064,11 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
                 _stop_event.set()
                 return
 
-            arr = np.frombuffer(buf, dtype=np.uint8).reshape((dev_h, dev_w, 3)).copy()
+            arr = np.frombuffer(buf, dtype=np.uint8).reshape((coded_h, coded_w, 3)).copy()
+            if rot_k:
+                # 转正画面（如 cvt 竖屏面板横用设备），零拷贝视图即可，
+                # make_surface 能处理带步长的数组
+                arr = np.rot90(arr, rot_k)
             with _frame_lock:
                 if _latest_frame[0] is not None:
                     _stat['dropped'] += 1   # 渲染没来得及取，直接覆盖
@@ -1095,7 +1143,9 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
                 disp_w = int(dev_w * scale)
                 disp_h = int(dev_h * scale)
                 if disp_w != dev_w or disp_h != dev_h:
-                    surf = pygame.transform.scale(surf, (disp_w, disp_h))
+                    # 缩小显示用 smoothscale（双线性滤波）：窗口小于 1:1 时，
+                    # 默认 scale 的最近邻采样会让细笔画文字闪烁/毛糙
+                    surf = pygame.transform.smoothscale(surf, (disp_w, disp_h))
                 ox = (sw - disp_w) // 2
                 oy = (sh - disp_h) // 2
                 screen.fill((0, 0, 0))
@@ -1106,14 +1156,14 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
                 # 没有新帧时短暂等待，避免空转
                 clock.tick(120)
 
-            # 帧率统计（每 10 秒打印一次）
+            # 帧率统计（每 10 秒一条，仅 verbose/debug 模式打印）
             now = time.time()
             elapsed = now - _stat['last_stat_t']
             if elapsed >= 10.0:
                 dec_fps = _stat['decode_frames'] / elapsed
                 ren_fps = _stat['render_frames'] / elapsed
-                print(f"[stat] decode={dec_fps:.1f}fps  render={ren_fps:.1f}fps"
-                      f"  dropped={_stat['dropped']}  elapsed={elapsed:.1f}s")
+                _log(f"[stat] decode={dec_fps:.1f}fps  render={ren_fps:.1f}fps"
+                     f"  dropped={_stat['dropped']}  elapsed={elapsed:.1f}s")
                 _stat['decode_frames'] = _stat['render_frames'] = _stat['dropped'] = 0
                 _stat['last_stat_t'] = now
 
@@ -1138,8 +1188,8 @@ def parse_args():
             "  python ohscrcpy_client.py -t <deviceId>  # 多设备时指定\n"
         ))
     p.add_argument("-t", "--target", default=None, help="设备 ID")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="显示详细日志")
+    p.add_argument("-v", "--verbose", "--debug", dest="verbose", action="store_true",
+                   help="详细日志（NALU 流水、帧率统计等周期性打印），默认不打印")
     p.add_argument("-o", "--record", default=None,
                    help="录制 H.264 流到文件（如 record.h264）")
     p.add_argument("--direct", default=None, metavar="HOST",

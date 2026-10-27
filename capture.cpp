@@ -222,8 +222,12 @@ bool Capture::Start()
     config.audioInfo.innerCapInfo.audioSampleRate  = 0;
     config.audioInfo.innerCapInfo.audioChannels    = 0;
     config.audioInfo.innerCapInfo.audioSource      = AudioCaptureSourceType::SOURCE_DEFAULT;
-    // 让采集画布跟随屏幕旋转（修复物理竖屏当横屏使用时画面截断的问题）
-    config.strategy.canvasFollowRotation = true;
+    // rotation=0 的常规设备：让采集画布跟随屏幕旋转（横竖屏切换时画布自动跟随）。
+    // 竖屏物理面板当横屏用的设备（cvt 等，rotation=90/270，主程序已把采集分辨率
+    // 交换成物理面板方向）：必须关闭跟随 —— 跟随模式下 RS 会把正立的逻辑横屏内容
+    // 再旋转屏幕角度并等比缩放居中，两侧补黑边；关闭后按请求方向满屏出图，
+    // 帧内容带屏幕旋转角，由客户端按协议头里的 rotation 字段转正显示。
+    config.strategy.canvasFollowRotation = (cfg_.rotation == 0);
 
     ret = capture_->Init(config);
     if (ret != SCREEN_CAPTURE_ERR_OK) {

@@ -45,8 +45,10 @@ struct CaptureConfig {
     int32_t width    = 1920;
     int32_t height   = 1080;
     int32_t fps      = 30;
-    // 码率（bps）。1080p 屏幕内容（文字/图标边缘）用 4Mbps 会明显发虚，默认给 12Mbps。
-    int32_t bitrate  = 12000000;
+    // 码率（bps）。屏幕内容运动时码率会真实用满，默认 20Mbps。
+    // 注意 RK 类硬编码器对静态画面按内部固定 QP 出图、无视该值（实测
+    // 12M/20M/40M 静态关键帧逐字节一致），调码率只影响运动场景清晰度。
+    int32_t bitrate  = 20000000;
     // 关键帧间隔（毫秒）。codec 侧按 gopSize = fps * iFrameIntervalMs / 1000 换算。
     // 注意：传 0 会让 GOP 变成 0（即不做周期性 I 帧刷新），P 帧量化误差持续累积，
     // 画面会越看越模糊；传负数更极端（gopSize=INT32_MAX）。OH 默认值就是 1000。

@@ -60,6 +60,7 @@
 #include <getopt.h>
 #include <unistd.h>
 #include <memory>
+#include <utility>
 
 #include "hilog/log.h"
 #include "capture.h"
@@ -79,8 +80,11 @@ struct OhscrcpyConfig {
     int32_t     width         = 1920;
     int32_t     height        = 1080;
     int32_t     fps           = 30;
-    // 码率（bps）：1080p 屏幕文字/图标边缘用 4Mbps 会明显发虚，默认 12Mbps
-    int32_t     bitrate       = 12000000;
+    // 码率（bps）：屏幕内容运动时（滚动/动画）码率会真实用满，12M 对
+    // 1200x1920@30 偏紧，默认 20M。注意 RK 类编码器对【静态】画面按内部固定
+    // QP 出图、无视码率（实测 12M/20M/40M 关键帧逐字节一致），调码率只影响
+    // 运动场景的清晰度。
+    int32_t     bitrate       = 20000000;
     // 关键帧间隔（毫秒）：0 会让 GOP=0（不周期刷新 I 帧）导致误差累积、越看越模糊
     int32_t     iFrameIntervalMs = 1000;
     // 码率控制模式：-1=不设置 0=CBR 1=VBR 2=CQ 3=SQR 11=CRF
@@ -122,7 +126,7 @@ void PrintUsage(const char *prog)
         "选项:\n"
         "  -w <宽>         视频宽度（默认 1920）\n"
         "  -h <高>         视频高度（默认 1080）\n"
-        "  -b <码率>       视频码率：>=100000 按 bps，较小值按 Mbps（默认 12Mbps）\n"
+        "  -b <码率>       视频码率：>=100000 按 bps，较小值按 Mbps（默认 20Mbps）\n"
         "  -f <帧率>       视频帧率（默认 30）\n"
         "  -p <视频端口>   TCP 视频服务端口（默认 8554）\n"
         "  -c <控制端口>   输入控制端口（默认 8555）\n"
@@ -151,12 +155,13 @@ int main(int argc, char *argv[])
     cfg.width      = 1920;
     cfg.height     = 1080;
     cfg.fps        = 30;
-    cfg.bitrate    = 12000000;
+    cfg.bitrate    = 20000000;
     cfg.iFrameIntervalMs = 1000;
     cfg.videoPort  = 8554;
     cfg.ctrlPort   = 8555;
 
     // —— 解析命令行参数 ——
+    bool userSetResolution = false; // 用户是否手动指定了 -w/-h
     static const struct option kLongOpts[] = {
         {"help",       no_argument, nullptr, 1000},
         {"debug",      no_argument, nullptr, 1001},
@@ -170,8 +175,8 @@ int main(int argc, char *argv[])
     int longIdx = 0;
     while ((opt = getopt_long(argc, argv, "w:h:f:b:p:c:i:", kLongOpts, &longIdx)) != -1) {
         switch (opt) {
-            case 'w': cfg.width    = atoi(optarg); break;
-            case 'h': cfg.height   = atoi(optarg); break;
+            case 'w': cfg.width    = atoi(optarg); userSetResolution = true; break;
+            case 'h': cfg.height   = atoi(optarg); userSetResolution = true; break;
             case 'f': cfg.fps      = atoi(optarg); break;
             case 'b': {
                 // 兼容两种写法：>= 100000 视为 bps（如 12000000），较小的数视为 Mbps（如 12）
@@ -240,22 +245,47 @@ int main(int argc, char *argv[])
         HILOG_WARN(LOG_CORE, "未检测到真实屏幕（设备无物理显示器），将使用虚拟屏直连编码器模式");
     }
 
-    // —— 有真实屏幕时查询真实分辨率（用户未手动指定时自动获取）——
+    // —— 有真实屏幕时查询分辨率与旋转角度 ——
     // 无屏时虚拟屏尺寸就是我们请求的 cfg.width x cfg.height，无需查询。
-    if (hasDisplay && cfg.width == 1920 && cfg.height == 1080) {
+    // 注意 GetRotation() 返回的是档位枚举（ROTATION_0..ROTATION_270 = 0..3），
+    // 乘 90 才是角度。
+    int32_t displayRotation = 0; // 屏幕旋转角（0/90/180/270），随协议头下发给客户端
+    if (hasDisplay) {
         auto display = OHOS::Rosen::DisplayManagerLite::GetInstance().GetDefaultDisplay();
         if (display != nullptr) {
             int32_t w = display->GetWidth();
             int32_t h = display->GetHeight();
-            if (w > 0 && h > 0) {
+            if (w > 0 && h > 0 && !userSetResolution) {
                 cfg.width  = w;
                 cfg.height = h;
                 HILOG_INFO(LOG_CORE, "真实屏幕分辨率: %{public}dx%{public}d", w, h);
+            } else if (w <= 0 || h <= 0) {
+                HILOG_WARN(LOG_CORE, "获取屏幕分辨率失败，使用默认 %{public}dx%{public}d",
+                           cfg.width, cfg.height);
             }
+            displayRotation = static_cast<int32_t>(display->GetRotation()) * 90;
+            HILOG_INFO(LOG_CORE, "屏幕旋转角度: %{public}d", displayRotation);
         } else {
             HILOG_WARN(LOG_CORE, "获取屏幕分辨率失败，使用默认 %{public}dx%{public}d",
                        cfg.width, cfg.height);
         }
+    }
+
+    // —— 竖屏物理面板当横屏用的设备（cvt 等，rotation=90/270）——
+    // 录制镜像按「逻辑横屏」请求画布时，RS 会把正立内容再旋转屏幕角度并等比
+    // 缩放居中，两侧补黑边（画面利用率只有 ~39%）；只有按「物理面板方向」请求
+    // 画布才能满屏出图（内容带屏幕旋转角）。所以这里把采集分辨率交换成物理面板
+    // 方向，旋转角度随协议头下发，由客户端转正显示；转正后的尺寸恰好等于逻辑
+    // 分辨率，客户端反控坐标无需额外变换。
+    if (displayRotation == 90 || displayRotation == 270) {
+        if (!userSetResolution) {
+            std::swap(cfg.width, cfg.height);
+            HILOG_INFO(LOG_CORE,
+                       "检测到旋转屏（rotation=%{public}d），按物理面板方向采集: %{public}dx%{public}d",
+                       displayRotation, cfg.width, cfg.height);
+        }
+    } else {
+        displayRotation = 0;
     }
 
     HILOG_INFO(LOG_CORE,
@@ -272,6 +302,8 @@ int main(int argc, char *argv[])
     // —— 启动 TCP 视频服务器（固定使用 Unix Domain Socket abstract 命名空间）——
     auto video = std::make_unique<Server>(cfg.videoPort, cfg.width, cfg.height,
                                           true, cfg.videoSockName);
+    // 旋转角度随每帧帧头下发，客户端据此转正画面（cvt 等旋转屏设备非 0）
+    video->SetRotation(displayRotation);
     if (!video->Start()) {
         HILOG_ERROR(LOG_CORE, "TCP 视频服务器启动失败");
         return 1;
@@ -311,6 +343,9 @@ int main(int argc, char *argv[])
     capCfg.iFrameIntervalMs = cfg.iFrameIntervalMs;
     capCfg.bitrateMode = cfg.bitrateMode;
     capCfg.quality = cfg.quality;
+    // 屏幕旋转角：非 0 时 capture.cpp 会关闭 canvasFollowRotation（按请求方向满屏
+    // 出图），并把它标记进编码器；客户端转正显示用的角度来自协议头
+    capCfg.rotation = displayRotation;
     // H.264 NALU 回调 —— 推送到 TCP 视频服务器
     capCfg.onNalu = [&video, h264Fd](const uint8_t *data, int32_t size,
                                      int64_t pts, bool isKey) {
