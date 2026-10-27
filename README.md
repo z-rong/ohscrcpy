@@ -14,9 +14,9 @@
 └──────────────────────────────────────────────────┘
          ↕  hdc fport (abstract unix socket)
 ┌──────────────────────────────────────────────────┐
-│  PC 客户端 (ohscrcpy_client.py)                   │
+│  PC 客户端 (ohscrcpy_client.py / .exe)            │
 │                                                  │
-│  TCP 收 NALU → OpenCV 解码 → pygame 渲染          │
+│  TCP 收 NALU → ffmpeg 解码 → pygame 渲染          │
 │  pygame 事件 → 输入协议 → TCP 发送                │
 └──────────────────────────────────────────────────┘
 ```
@@ -57,35 +57,65 @@ IDR 帧，此后转为实时推送。客户端必须按上表解析帧头。
 PC 端（Windows）需要：
 
 ```bash
-pip install pygame opencv-python numpy
+pip install numpy pygame
 ```
 
-另外需要系统安装 **ffmpeg** 并确保在 PATH 中。
+另外需要系统安装 **ffmpeg** 并确保在 PATH 中（用下面的打包脚本可省掉这一步）。
 
 ## 免 Python 环境使用（打包单文件 exe）
 
-无需在目标机器上安装 Python / OpenCV / ffmpeg，只需 `dist/ohscrcpy_client.exe`
-（约 104MB，已内嵌运行库、ffmpeg 和设备端二进制）与 hdc。
+无需在目标机器上安装 Python / numpy / pygame，也无需自己装 ffmpeg，只需
+`dist/ohscrcpy_client.exe`（内嵌运行库、ffmpeg 和设备端二进制）与 hdc。
 
 从源码重新打包（需要一台装有 Python 3.10+ 的机器）：
 
 ```powershell
-pip install pyinstaller opencv-python pygame numpy
+pip install pyinstaller numpy pygame
 powershell -ExecutionPolicy Bypass -File client\build_exe.ps1
-# 产物: dist\ohscrcpy_client.exe
+# 产物: dist\ohscrcpy_client.exe（单文件，拷走即用）
+```
+
+`build_exe.ps1` 会自动内嵌两样外部程序，并在打包前把它们的存在性当硬校验：
+
+| 内嵌内容 | 来源 | 说明 |
+|---|---|---|
+| `ohscrcpy` | `client/ohscrcpy` | 设备端可执行文件，客户端会自动 `hdc file send` 到设备 |
+| `ffmpeg.exe` | PATH 中的 ffmpeg | 客户端用它解码 H.264；缺省时从 PATH 找 |
+
+可选参数：
+
+```powershell
+# 指定要内嵌的 ffmpeg
+... -File client\build_exe.ps1 -FfmpegPath C:\tools\ffmpeg.exe
+# 不内嵌 ffmpeg（目标机器需自己配 PATH）
+... -File client\build_exe.ps1 -NoFfmpeg
+# 目录版：运行时零临时文件，但分发要带整个 dist\ohscrcpy_client\ 目录
+... -File client\build_exe.ps1 -OneDir
+# 保留 build 中间目录，便于排查
+... -File client\build_exe.ps1 -KeepBuild
 ```
 
 打包版说明：
-- 首次启动时 exe 会把内嵌的运行库释放到系统临时目录（`%TEMP%\_MEIxxxx`），
-  属 PyInstaller 单文件机制的正常行为，退出后自动清理；启动比脚本版慢数秒。
+- 单文件版启动时把内嵌内容解压到**启动时的工作目录**（双击运行、或在 exe 所在
+  目录运行时即 exe 当前目录）下的 `_MEI<pid>xxxx` 子目录，**正常退出自动删除**；
+  异常退出（崩溃/强杀）的残留留在原地，可放心手动删除。多设备同时开多个实例时
+  各用各的 `_MEI` 目录，互不冲突。
+- 因此要求启动目录可写：放在 Program Files、网络共享等只读位置会启动失败。
+  完全不想要解压/临时文件时用 `-OneDir` 打目录版。
+- ⚠️ 若启动时报 `[PYI-xxxx:ERROR] Could not create temporary directory!`，
+  说明解压目录建不起来：检查启动目录是否可写，以及 exe 是否继承了
+  **Low 强制完整性标签**（`icacls <exe所在目录>` 输出里出现
+  `Mandatory Label\Low Mandatory Level`；修复：`icacls <目录> /setintegritylevel M`，
+  注意父目录链也要查，标签会向下继承）。`build_exe.ps1` 打包后会自动检查产物
+  标签并在发现问题时给出提示。
 - 设备端二进制 `ohscrcpy` 已内嵌；若 exe 同目录存在同名文件则优先使用，便于替换调试。
 - `OHS_LOGFILE=日志路径` 环境变量可将运行日志同时写入文件，便于现场排查。
 - `--direct <host> --video-port <p> --ctrl-port <p>` 可跳过 hdc 直接连接
-  已就绪的服务端端口（调试用）；配合 `client/mock_device.py` 可在无真机环境下
-  做端到端测试。
+  已就绪的服务端端口（调试用）。
 - `--no-ui-restart`（旧名 `--no-restart-launcher`）：默认在检测到虚拟屏时自动重启
   SystemUI 与桌面并解锁（否则状态栏/导航栏一直是 0x0、桌面上只剩一张壁纸，
   点了没反应），该开关用于关掉这个行为。
+
 
 ## 使用方法
 
@@ -168,7 +198,7 @@ hdc -t <device_id> shell "aa force-stop com.ohos.launcher"        # 桌面只建
 | `-i <毫秒>`（服务端） | 1000 | 关键帧间隔。**原先写死 0 → GOP=0，即不做周期性 I 帧刷新**，P 帧量化误差持续累积，动态画面会越看越糊，本次已修。 |
 | `-w/-h`（服务端） | 1920×1080 | 虚拟屏分辨率。 |
 | `--rate-mode <模式>`（服务端） | 不设置 | 本机硬件（`OMX.rk.video_encoder.avc`）**只支持 `cbr` / `vbr`**；`cq` / `crf` 会被硬件拒绝并导致采集**直接失败**（见下）。 |
-| `--max-height N`（客户端） | 0 = 按设备原始分辨率 | 窗口初始高度。渲染侧已**禁止放大超过 1:1**，窗口被拉大时只做 letterbox，避免上采样发虚。 |
+| `--max-height N`（客户端） | 0 = 按设备原始分辨率 | 窗口初始高度。超过屏幕时自动按比例缩小到屏幕内（窗口始终带标题栏打开，可最大化/还原）。渲染侧已**禁止放大超过 1:1**，窗口被拉大时只做 letterbox，避免上采样发虚。 |
 | `--server-args "..."`（客户端） | 空 | 把上面这些服务端参数从 PC 侧透传过去。 |
 
 #### 关于 `--density`：这是缩放取舍，不是清晰度开关
@@ -347,5 +377,6 @@ ffplay capture.h264
 | `include/server.h` | TCP 视频服务器接口及帧协议定义 |
 | `include/input.h` | 输入控制服务接口及控制协议定义 |
 | `BUILD.gn` | GN 构建脚本 |
-| `client/ohscrcpy_client.py` | Python 客户端（pygame + OpenCV） |
+| `client/ohscrcpy_client.py` | Python 客户端（ffmpeg 解码 + pygame 渲染） |
+| `client/build_exe.ps1` | 打包单文件 exe 的脚本（内嵌 ffmpeg 与设备端二进制） |
 

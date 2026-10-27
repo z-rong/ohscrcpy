@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ohscrcpy_client_opencv.py — OpenHarmony 投屏客户端（OpenCV 版）
+ohscrcpy_client.py — OpenHarmony 投屏客户端
 
-核心改进：
-  · 用 OpenCV (cv2) 替代 pygame + ffmpeg pipe，硬件解码 + 高效渲染
-  · cv2.VideoCapture 直接从 pipe 读取 H.264 流，内部硬件解码
-  · cv2.imshow 同一窗口显示 + cv2.setMouseCallback/waitKey 捕获输入
-  · 性能：硬件解码 + 零拷贝渲染，延迟远低于 pygame 方案
+架构：
+  · ffmpeg 子进程负责 H.264 解码（硬件加速优先），输出 bgr24 rawvideo 到管道
+  · pygame 负责窗口渲染与鼠标/键盘事件捕获
+  · 后台线程收 NALU → 写 ffmpeg stdin，另一个线程读 rawvideo → 只保留最新一帧
 
 依赖：
-    pip install opencv-python numpy
-    系统需安装 ffmpeg（OpenCV 后端）
+    pip install numpy pygame
+    系统需安装 ffmpeg 并置于 PATH（或用 build_exe.ps1 打包成单文件 exe，
+    ffmpeg 与设备端二进制均已内嵌）
 
 用法：
-    python ohscrcpy_client_opencv.py              # 单设备时直接运行
-    python ohscrcpy_client_opencv.py -t <deviceId> # 多设备时指定
+    python ohscrcpy_client.py              # 单设备时直接运行
+    python ohscrcpy_client.py -t <deviceId> # 多设备时指定
 """
 
 import argparse
@@ -29,7 +29,6 @@ import threading
 import time
 import zlib
 
-import cv2
 import numpy as np
 import pygame
 
@@ -54,7 +53,8 @@ LOCAL_VIDEO_PORT = 8554
 LOCAL_CTRL_PORT  = 8555
 
 VERBOSE = False
-# 窗口初始最大高度：0 = 直接用设备原始分辨率（1:1，最清晰）。
+# 窗口初始最大高度：0 = 按设备原始分辨率（1:1，最清晰），但仍会自动缩小到
+# 屏幕以内（见 _run_app），保证窗口带标题栏打开、可自由缩放。
 # 渲染时也不会放大超过 1:1 —— 窗口被拉大于设备分辨率时只做 letterbox，
 # 避免上采样导致的发虚。
 MAX_HEIGHT = 0
@@ -141,6 +141,17 @@ class HdcSession:
                                encoding="utf-8", errors="replace", timeout=timeout)
         except FileNotFoundError:
             raise RuntimeError("找不到 hdc 命令，请确认 hdc 已安装并在 PATH 中")
+        except subprocess.TimeoutExpired:
+            # 另一台设备正在投屏时，hdc server 忙着转发视频流，新的 shell
+            # 命令可能排队超过 timeout 秒。check=False 的命令本来就是尽力而为
+            # （killall / fport rm / hidumper 等），超时按失败忽略即可；
+            # check=True 的转成带提示的 RuntimeError，别把裸调用栈甩给用户。
+            if check:
+                raise RuntimeError(
+                    f"hdc 命令超时（{timeout}s）: {cmd_str}\n"
+                    f"  多设备并发投屏时 hdc server 容易忙，稍后重试一般即可恢复")
+            print(f"[hdc] 命令超时（{timeout}s），忽略: {cmd_str}")
+            return ""
         output = (r.stdout or "").strip()
         err = (r.stderr or "").strip()
         if VERBOSE and output:
@@ -293,8 +304,11 @@ class HdcSession:
                     + "\n    ".join(device_list))
             self.target = device_list[0]
             print(f"[hdc] 使用默认设备: {self.target}")
+        # 清掉设备上遗留的旧服务端。另一台设备正在投屏时 hdc server 忙着转发
+        # 视频流，这条命令可能排队较久，超时给足到 15s；即便超时也只是忽略
+        # （旧进程真没杀掉的话，下面 file send 会报 Text file busy 自然暴露）
         self._run(self._hdc_cmd("shell", f"killall {SERVER_BIN}"),
-                  check=False, timeout=5)
+                  check=False, timeout=15)
         local_bin = find_resource(SERVER_BIN)
         if not local_bin:
             raise RuntimeError(
@@ -610,9 +624,9 @@ class CtrlClient:
             pass
 
 
-# ── NALU 转发：TCP → ffmpeg pipe → cv2.VideoCapture ──────────────────────────
+# ── NALU 转发：TCP → ffmpeg pipe → rawvideo → pygame ─────────────────────────
 class NaluRelay:
-    """从 TCP 收 NALU，剥头后写入 ffmpeg stdin，供 cv2.VideoCapture 读取"""
+    """从 TCP 收 NALU，剥头后写入 ffmpeg stdin，供读帧线程消费"""
     def __init__(self, host, port, record_path=None):
         self._host = host
         self._port = port
@@ -695,7 +709,7 @@ class NaluRelay:
             "-flags2", "+fast",
             "-fflags", "nobuffer+flush_packets",
         ]
-        # 若指定输出尺寸则在 ffmpeg 内缩放，省掉 Python 侧 cv2.resize
+        # 若指定输出尺寸则在 ffmpeg 内缩放，省掉 Python 侧缩放
         if self._out_width > 0 and self._out_height > 0:
             cmd += ["-vf", f"scale={self._out_width}:{self._out_height}"]
         cmd += [
@@ -847,7 +861,7 @@ class NaluRelay:
                         pass
 
 
-# ── OH 按键映射（cv2 key → OH KEYCODE）──────────────────────────────────────
+# ── OH 按键映射（pygame key → OH KEYCODE）───────────────────────────────────
 OH_KEY_MAP = {
     13:  66,   # Enter → KEYCODE_ENTER
     8:   67,   # Backspace → KEYCODE_DEL
@@ -916,7 +930,22 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
     else:
         win_w, win_h = dev_w, dev_h
 
-    # 告知 relay ffmpeg 输出尺寸（让 ffmpeg 内部缩放，省掉 Python cv2.resize）
+    # 窗口必须装得进屏幕：设备分辨率往往比显示器还大（如 1260x2720 的手机屏
+    # 对 1920x1080 的显示器），按 1:1 建出来的窗口会超出桌面，标题栏（含最小化/
+    # 最大化按钮）被顶出屏幕外，看起来就像全屏且无法缩放。这里按比例缩到
+    # 主屏的 90% 以内再开窗；渲染侧本来就是 letterbox 等比缩放，不受影响。
+    pygame.init()
+    try:
+        desk_w, desk_h = pygame.display.get_desktop_sizes()[0]
+    except (IndexError, AttributeError, pygame.error):
+        info = pygame.display.Info()
+        desk_w, desk_h = info.current_w, info.current_h
+    _fit = min(1.0, desk_w * 0.9 / win_w, desk_h * 0.9 / win_h)
+    if _fit < 1.0:
+        win_w = max(1, int(win_w * _fit))
+        win_h = max(1, int(win_h * _fit))
+
+    # 告知 relay ffmpeg 输出尺寸（让 ffmpeg 内部缩放，省掉 Python 侧重采样）
     # 不再让 ffmpeg 缩放，改用 pygame 渲染时直接 transform.scale，减少 ffmpeg 负担
     relay.set_output_size(0, 0)  # 0 = 不缩放，输出原始 dev 分辨率
 
@@ -930,9 +959,7 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
             ctrl.close()
         return
 
-    # 创建 OpenCV 窗口
     # ── pygame 窗口 ──────────────────────────────────────────────────────────
-    pygame.init()
     screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
     pygame.display.set_caption("ohscrcpy")
     clock = pygame.time.Clock()
@@ -1103,12 +1130,12 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="ohscrcpy 客户端（OpenCV 版，硬件解码 + 高效渲染）",
+        description="ohscrcpy 客户端（ffmpeg 解码 + pygame 渲染）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例:\n"
-            "  python ohscrcpy_client_opencv.py                # 单设备直接运行\n"
-            "  python ohscrcpy_client_opencv.py -t <deviceId>  # 多设备时指定\n"
+            "  python ohscrcpy_client.py                # 单设备直接运行\n"
+            "  python ohscrcpy_client.py -t <deviceId>  # 多设备时指定\n"
         ))
     p.add_argument("-t", "--target", default=None, help="设备 ID")
     p.add_argument("-v", "--verbose", action="store_true",
@@ -1122,7 +1149,8 @@ def parse_args():
     p.add_argument("--ctrl-port", type=int, default=LOCAL_CTRL_PORT,
                    help="直连模式控制端口（默认 8555）")
     p.add_argument("--max-height", type=int, default=0, metavar="N",
-                   help="窗口初始最大高度像素；0（默认）= 按设备原始分辨率 1:1 显示，最清晰")
+                   help="窗口初始最大高度像素；0（默认）= 按设备原始分辨率 1:1 显示，"
+                        "超过屏幕时自动缩小到屏幕内")
     p.add_argument("--server-args", default="", metavar="ARGS",
                    help="追加传给设备端 ohscrcpy 的参数，用于调画质，"
                         "如 --server-args \"-b 20000000 -i 500\"")
