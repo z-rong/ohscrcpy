@@ -37,25 +37,6 @@
 新客户端接入后不会立即收到画面：服务端会先补发缓存的 SPS/PPS，再补发最近的
 IDR 帧，此后转为实时推送。客户端必须按上表解析帧头。
 
-### 旋转屏设备（竖屏物理面板当横屏用，如 cvt 产品）
-
-这类设备的物理面板是竖屏（如 1200x1920），系统以 90°/270° 旋转做横屏逻辑屏
-（如 1920x1200）用。录屏镜像若按「逻辑横屏」请求画布，RS 会把正立内容再旋转
-屏幕角度并等比缩放居中，两侧补黑边（画面利用率只有 ~39%）。
-
-服务端的处理（自动检测，无需手动指定参数）：
-
-1. 检测到 `rotation` 为 90/270 时，按**物理面板方向**（逻辑宽高互换）采集，
-   画面满屏无黑边（帧内容带屏幕旋转角）；
-2. 旋转角度随帧头 `rotation` 字段下发；
-3. 客户端按该角度把画面转正显示（旋转后宽高互换，恰好等于逻辑分辨率），
-   反控触摸坐标直接按转正后的尺寸映射，无需额外变换。
-
-注意：帧头从 25 字节扩到 29 字节，客户端与服务端必须配套升级（客户端 hdc
-模式每次会自动重推匹配的服务端二进制，正常使用不会混版本）。`-o` 录制的
-裸流保持编码帧方向（与 scrcpy 一致），需要转正可用
-`ffmpeg -i in.h264 -vf "transpose=2" ...`（rotation=270 时）。
-
 ## 编译（服务端）
 
 ### 前提
@@ -122,7 +103,7 @@ powershell -ExecutionPolicy Bypass -File client\build_exe.ps1
   各用各的 `_MEI` 目录，互不冲突。
 - 因此要求启动目录可写：放在 Program Files、网络共享等只读位置会启动失败。
   完全不想要解压/临时文件时用 `-OneDir` 打目录版。
-- ⚠️ 若启动时报 `[PYI-xxxx:ERROR] Could not create temporary directory!`，
+- 若启动时报 `[PYI-xxxx:ERROR] Could not create temporary directory!`，
   说明解压目录建不起来：检查启动目录是否可写，以及 exe 是否继承了
   **Low 强制完整性标签**（`icacls <exe所在目录>` 输出里出现
   `Mandatory Label\Low Mandatory Level`；修复：`icacls <目录> /setintegritylevel M`，
@@ -166,38 +147,6 @@ python ohscrcpy_client.py -t <device_id>
 客户端在检测到虚拟屏后会**自动补齐 UI**（SystemUI → 桌面 → 上滑解锁）；
 不想让它动设备 UI 时加 `--no-ui-restart`（旧名 `--no-restart-launcher` 仍可用），再手工执行：
 
-```bash
-hdc -t <device_id> shell "killall com.ohos.systemui"              # 状态栏/导航栏 0x0
-hdc -t <device_id> shell "aa force-stop com.ohos.launcher"        # 桌面只建了壁纸窗口
-# 然后手工在画面上从底部上滑一次解锁
-```
-
-**为什么必须补这一步：**
-
-- **SystemUI（状态栏 / 导航栏 / 锁屏）**：SystemUI 在开机时初始化
-  `NavBarConfiguration.initNavBarConfiguration()`：
-  ```ts
-  display.getDefaultDisplay().then(dis => { maxWidth = dis.width; ... })
-  ```
-  此刻无屏设备上系统里一块屏都没有 → 该 Promise 失败 → `maxWidth/maxHeight`
-  保持 `undefined` → 窗口按 **0×0** 创建。而 SystemUI 只注册了
-  `display.on('change')`（且仅当「方向变化」时才 `resetSizeWindow`），
-  虚拟屏是 `display.on('add')` 事件，**永远不会触发重排** —— 于是
-  `SystemUi_StatusBar / NavigationBar / PrivacyIndicator / ScreenLockWindow`
-  一直是 `[0,0,0,0]`，看起来就是「SystemUI 没起来」。
-  重启 SystemUI，它会按真实分辨率重建窗口（1920×75 等）。
-- **桌面**：`DisplayManager.createMainWindow()` 特意跳过默认屏
-  （"主屏不需要创建主窗口"），所以光把虚拟屏设为默认屏，桌面不会在上面建窗口；
-  它只在启动时按 `display.getDefaultDisplaySync().id` 判断一次「谁是主屏」，
-  之后不再复查。重启桌面即可让它在虚拟屏上建出正常桌面。
-- **解锁**：SystemUI 起来后 keyguard 才真正生效（`ScreenLockWindow` 变成全屏），
-  会盖住桌面，需要一次从底部上滑解锁。
-
-> 注意顺序：服务端的 abstract socket **先于**虚拟屏创建，客户端必须**等虚拟屏
-> 真正出现**（轮询 `hidumper -s DisplayManagerService -a '-s -a'` 里的
-> `DevEcoViewer` + 默认屏）再去重启 SystemUI，否则 SystemUI 又会在「没有屏」的
-> 状态下重启一次，窗口依旧是 0×0。
-
 **已知限制**：
 - 屏名借用系统保留的 `DevEcoViewer` 通道。
 - 虚拟屏一旦被设为默认屏就**无法销毁**（`DestroyVirtualScreen` 会返回
@@ -221,116 +170,6 @@ hdc -t <device_id> shell "aa force-stop com.ohos.launcher"        # 桌面只建
 | `--max-height N`（客户端） | 0 = 按设备原始分辨率 | 窗口初始高度。超过屏幕时自动按比例缩小到屏幕内（窗口始终带标题栏打开，可最大化/还原）。渲染侧已**禁止放大超过 1:1**，窗口被拉大时只做 letterbox，避免上采样发虚。 |
 | `--server-args "..."`（客户端） | 空 | 把上面这些服务端参数从 PC 侧透传过去。 |
 
-#### 关于 `--density`：这是缩放取舍，不是清晰度开关
-
-同一个 UI，在两种密度下的表现不同，取决于你怎么看：
-
-| 比较方式 | VPR 1.5（默认 240dpi） | VPR 1.0（160dpi） |
-|---|---|---|
-| **按 1:1 显示**（客户端默认，你实际看到的） | 元素更大更好读，但每个元素被放大 1.5 倍，观感偏柔 | 元素更小，但逐像素映射，观感更"利" |
-| **归一化到同一元素尺寸**（比信息量） | 图标细节**更多**（更高密度会取用更高分辨率的图片资源） | 图标被缩小显示，细节反而更少 |
-
-所以：**想读得大就保持 240；想逐像素锐利、且能接受 UI 变小就用 160**；
-两者之间可以试 `--density 200`（VPR 1.25）折中。
-
-> ⚠️ 修正说明：本文档早期版本曾把「改 `--density 160`」写成主要的清晰度提升手段。
-> 那个结论来自**同一放大倍数**下的目视对比，且两张样本**一张是串流帧、一张是原始快照**，
-> 不是同类对比。上面这张表是重新做了尺寸归一化对比后的结论。
-
-推荐（先保持平台默认密度，只把码率/关键帧和客户端 1:1 打开）：
-
-```bash
-python ohscrcpy_client.py -t <device_id> --server-args "-b 20000000 -i 500"
-```
-
-若想 UI 更大或更小，再追加 `--density 160`（更小更利）或 `--density 200`（折中）。
-
-#### 排查过程（怎么定位到「不是编码的锅」）
-
-1. 放大画面看，字形边缘是柔和渐变 → 第一反应是编码码率不够；
-2. 先修 `-b`（发现它根本没生效）并把默认提到 12 Mbps，再把 `-i` 从 0 改成 1000；
-3. 但用 Laplacian 方差量化对比，改前 6772 / 改后 6769 —— **几乎没变化**；
-4. 换用设备自带 `snapshot_display` 抓**完全没经过 H.264 的原始画面**，同区域得分反而更低（6155）
-   → **证明编码不是瓶颈**；改动 `-b` 1/4/12/24 Mbps 时编码器实际输出恒为 0.73~0.80 Mbps，
-   也说明静态画面下码率上限根本不是约束；
-5. 最终确认：**1080p 下这条链路（虚拟屏→RS→编码器→客户端）已经是透明的**，
-   没有明显可再榨取的空间；真正决定观感的是平台密度与客户端显示缩放。
-
-> 顺带：`snapshot_display` 现在可用（虚拟屏成了默认屏之后），是个很好用的画质排查工具：
-> `hdc shell "snapshot_display -f /data/local/tmp/s.jpeg"` + `hdc file recv`（只支持 .jpeg）。
-
-#### cvt 设备（真实屏）静态画面清晰度的上限（2026-10 实测）
-
-cvt（nantian）真实屏链路上复测了同样的问题，结论与虚拟屏一致并更定量：
-
-- 设备无损截图（`snapshot_display`）里图标标签清晰可读，采集编码后同区域
-  小字被抹掉 —— 损失发生在编码环节；
-- RK 编码器（`rk.video_encoder.avc`）静态画面按内部固定 QP 出图：12M/20M/40M
-  码率下静态关键帧**逐字节几乎一致**（37095 字节 ≈ 0.13 bit/px）；
-- `cq` / `crf` / `sqr` 码控模式 Configure 全被编码器拒绝（错误 63570468），
-  `libavcenc_ohos.z.so`（软编）未随镜像打包，profile 不可透传 ——
-  **不动系统镜像时，设备侧已无 API 可提高静态画面质量**；
-- 参照实验：设备截图用 x264 编到 19.8KB（不到 RK 的 37KB 的一半），
-  图标标签仍清晰可读 —— 说明码量足够，是 RK 编码器静态 QP 偏高所致。
-  要根治需镜像级动作（编入软编库 / 调 HDF 编码器 quality 配置 / 换固件）。
-
-客户端侧已做两项确定性改进：Windows 高分屏缩放下按**物理像素**建窗口
-（避免"0.6x 缩小 + 系统 1.5x 放大"的双重模糊），窗口小于 1:1 时用
-`smoothscale`（双线性）替代最近邻缩放。
-
-#### 虚拟屏与真实屏的对比（跨设备实测）
-
-在带屏设备 `swqaewqe` 上同样跑一遍，得到两条关键结论：
-
-**1. 虚拟屏不引入任何画质差异 —— 与真实屏逐像素一致**
-
-`swqaewqe` 的真实屏是 `Unknown REAL, 1920x1080, VPR 1.5`；无屏设备的虚拟屏
-设为同样参数后，两边用 `snapshot_display` 取原始画面，**4 个采样区域 MD5 完全相同**：
-
-```
-760:170:0:140        完全一致 ✔
-600:200:600:300      完全一致 ✔
-500:120:1200:700     完全一致 ✔
-300:100:1600:150     完全一致 ✔
-```
-
-**2. 所以「模糊」在带屏设备上同样存在**
-
-`swqaewqe` 的真实屏**也是 VPR 1.5** —— 这个密度是平台默认值，不是虚拟屏特有的。
-两边渲染逐像素一致，也就意味着**同样的柔和程度**。串流侧同样持平：
-同区域 Laplacian 方差 无屏虚拟屏 **10089** vs 带屏真实屏 **9841**。
-
-**3. 代码路径无回归**
-
-带屏设备上 `HasRealDisplay()` 正确识别（日志 `发现真实屏幕: Unknown (id=0)`），
-走原来的 `AVScreenCapture`，**不会创建虚拟屏**：
-
-```
-I ohscrcpy_vdisplay: 发现真实屏幕: Unknown (id=0)
-I ohscrcpy: 真实屏幕分辨率: 1920x1080
-I ohscrcpy_capture: 屏幕采集+编码已启动 1920x1080 @30fps
-```
-
-**4. 排除的两个嫌疑**
-
-- `VirtualScreenOption::isForShot_`：只是 IPC 透传字段（默认就是 `true`），不参与渲染决策；
-- `VirtualScreenFlag`：取值只有 `DEFAULT=0 / CAST=1 / MAX=2`，我们用 `DEFAULT` 是对的。
-
-因此**在 1080p 不变的前提下，能动的只有密度**（`--density`）：
-这是「UI 更大但被放大 1.5 倍」与「1:1 最清晰但 UI 更小」之间的取舍。
-
-#### 硬件码率模式实测
-
-```
---rate-mode cbr → HCODEC: set 0 mode and target bitrate 12000000 bps succ    ✅ 110 NALUs
---rate-mode vbr → HCODEC: set 1 mode and target bitrate 12000000 bps succ    ✅ 110 NALUs
---rate-mode cq  → HCODEC: SetConstantQualityMode failed
-                  (OMX_IndexParamControlRateConstantQuality)                 ❌ 0 NALUs，采集失败
---rate-mode crf → HCODEC: SetCRFMode failed (OMX_IndexParamControlRateCRF)   ❌ Configure 直接失败
-```
-
-即这台板子的编码器**没有恒定质量（CQ/CRF）能力**，所以「按质量分配码率」这条路走不通，
-清晰度只能从**渲染分辨率/密度**和**码率上限**这两处调。
 
 ### 常规用法
 
@@ -351,38 +190,6 @@ python ohscrcpy_client.py -t <device_id> -v
 
 客户端会自动完成：推送二进制 → 端口转发 → 启动服务端 → 连接 → 显示画面。
 退出时自动清理（杀进程、删文件、移除转发）。
-
-### 多设备同时连接 / 切换设备
-
-本地端口**不是**按设备隔离的：`hdc` 的 `fport` 在**整台 PC 上全局绑定**
-`127.0.0.1:<port>`。所以两台设备都用 `tcp:8554` 时，第二台必然失败：
-
-```
-[Fail]TCP Port listen failed at 8554
-```
-
-因此客户端现在**按设备 ID 分配端口槽**（视频/控制成对），并把实际使用的端口打印出来：
-
-```
-[hdc] 端口转发已建立: tcp:8590→localabstract:ohscrcpy_video, tcp:8591→localabstract:ohscrcpy_ctrl
-```
-
-两台设备可以同时开两个客户端，互不影响。
-
-另外两个必须注意的 `hdc` 行为（客户端已处理，手工操作时也要小心）：
-
-1. **`hdc fport rm` 的任务串必须是两个参数**：
-   ```bash
-   hdc fport rm tcp:8554 localabstract:ohscrcpy_video     # 正确
-   hdc fport rm "tcp:8554 localabstract:ohscrcpy_video"   # 错误：ruler is not exist，规则没删掉
-   ```
-   后者会返回 `[Fail]Remove forward ruler failed, ruler is not exist`，
-   但规则其实还在 —— 于是「切换设备后连的仍是上一台」。
-   客户端现在会删完再 `fport ls` 复核，确认端口真的释放。
-2. `hdc fport ls` 里没有、但 `127.0.0.1:<port>` 仍处于 `LISTENING` 的情况确实存在
-   （hdc server 残留监听）。这时再 `fport` 同一个端口一定失败，
-   所以客户端选端口前会先做本地 bind 探测，被占用就换下一个槽，
-   绝不再「假设已有规则可复用」。彻底清掉残留只能重启 hdc server（`hdc kill`）。
 
 ### 调试：导出 H.264 码流
 

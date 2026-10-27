@@ -403,7 +403,10 @@ int main(int argc, char *argv[])
     pause();
 
     if (h264Fd >= 0) { close(h264Fd); }
-    // 回收本进程创建的虚拟屏（进程被信号直接杀掉时由 DMS 的 death recipient 兜底回收）
+    // 回收本进程创建的虚拟屏。注意：虚拟屏已被设为默认屏，DMS 的
+    // DestroyVirtualScreen 对默认屏一律拒绝（dmserver/abstract_screen_controller.cpp
+    // 检查 rsScreenId == defaultRsScreenId_，含进程被杀时的 OnRemoteDied 兜底路径），
+    // 所以这里通常只是打一条失败日志；遗留屏由下次启动 FindOurVirtualScreen 复用。
     ohscrcpy::DestroyVirtualDisplay();
     HILOG_INFO(LOG_CORE, "ohscrcpy 已退出");
     return 0;
