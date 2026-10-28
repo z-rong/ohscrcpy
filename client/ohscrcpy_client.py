@@ -891,13 +891,42 @@ class NaluRelay:
 
 
 # ── OH 按键映射（pygame key → OH KEYCODE）───────────────────────────────────
-OH_KEY_MAP = {
-    13:  66,   # Enter → KEYCODE_ENTER
-    8:   67,   # Backspace → KEYCODE_DEL
-    27:  4,    # Esc → KEYCODE_BACK
-    32:  62,   # Space → KEYCODE_SPACE
-    127: 112,  # Delete → KEYCODE_FORWARD_DEL
-    ord('h'): 3,  # h → KEYCODE_HOME (示例)
+# ── 键盘映射：pygame 按键 → OHOS KeyCode ─────────────────────────────────────
+# 注意：OHOS MMI 的 KeyEvent::KeyCode 是 2000+ 编号（mmi 框架
+# frameworks/proxy/events/src/key_event.cpp），与 Android 风格键码完全不同
+# （旧映射 Enter=66 等在这个平台上全是错的，注入不生效）。
+
+OH_KEY_SPECIAL = {
+    pygame.K_TAB: 2049,        # TAB
+    pygame.K_RETURN: 2054,     # Enter
+    pygame.K_BACKSPACE: 2055,  # 退格
+    pygame.K_DELETE: 2071,     # Delete
+    pygame.K_SPACE: 2050,      # 空格
+    pygame.K_UP: 2012, pygame.K_DOWN: 2013,
+    pygame.K_LEFT: 2014, pygame.K_RIGHT: 2015,
+    pygame.K_HOME: 2081, pygame.K_END: 2082,
+    pygame.K_PAGEUP: 2068, pygame.K_PAGEDOWN: 2069,
+    pygame.K_INSERT: 2083,
+    pygame.K_KP_ENTER: 2054,
+}
+for _i in range(10):   # 小键盘数字按对应数字注入
+    OH_KEY_SPECIAL[getattr(pygame, f"K_KP{_i}")] = 2000 + _i
+for _i in range(1, 13):  # F1~F12
+    OH_KEY_SPECIAL[getattr(pygame, f"K_F{_i}")] = 2089 + _i
+
+# 物理修饰键不再单独注入：OHOS 的组合键依赖「事件内携带的按住键列表」
+# （mmi key_event_normalize 的 IsShiftPressed / KeyCodeToUnicode），
+# 客户端把 PC 修饰键状态作为 mods 位图随每个键事件一起发送。
+OH_MOD_SHIFT, OH_MOD_CTRL, OH_MOD_ALT = 1, 2, 4
+
+# 符号键位 → 键码（pygame 键常量 → OH KeyCode）；是否加 Shift 由 PC 的
+# 修饰键状态决定（shift+符号 = 同一键位 + 代按 Shift，设备侧自行产生符号）
+OH_SYMBOLS = {
+    pygame.K_BACKQUOTE: 2056, pygame.K_MINUS: 2057, pygame.K_EQUALS: 2058,
+    pygame.K_LEFTBRACKET: 2059, pygame.K_RIGHTBRACKET: 2060,
+    pygame.K_BACKSLASH: 2061, pygame.K_SEMICOLON: 2062,
+    pygame.K_QUOTE: 2063, pygame.K_COMMA: 2043, pygame.K_PERIOD: 2044,
+    pygame.K_SLASH: 2064,
 }
 
 
@@ -979,6 +1008,9 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
     # 最大化按钮）被顶出屏幕外，看起来就像全屏且无法缩放。这里按比例缩到
     # 主屏的 90% 以内再开窗；渲染侧本来就是 letterbox 等比缩放，不受影响。
     pygame.init()
+    # 键盘长按重复：pygame 默认按住只发一次 KEYDOWN。开启后按住会持续收到
+    # 重复 KEYDOWN，由键盘处理逻辑重触发注入，实现长按连续输入
+    pygame.key.set_repeat(400, 50)
     try:
         desk_w, desk_h = pygame.display.get_desktop_sizes()[0]
     except (IndexError, AttributeError, pygame.error):
@@ -1028,9 +1060,58 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
         return max(0, min(dev_w - 1, dx)), max(0, min(dev_h - 1, dy))
 
     print(f"[main] 设备 {dev_w}x{dev_h}（编码 {coded_w}x{coded_h} rotation={rotation}），窗口 {win_w}x{win_h}")
-    print("[main] 鼠标点击/拖动=触摸注入  Esc=退出  h=Home")
+    print("[main] 鼠标点击/拖动=触摸注入  PC键盘可输入  Esc=退出")
 
     frame_size = coded_w * coded_h * 3  # BGR = 3 bytes/pixel，ffmpeg 按编码帧方向输出
+
+    # ── 键盘映射 ──────────────────────────────────────────────────────────
+    _pressed_keys = {}  # pygame key → (OH 键码, mods 位图)，用于 KEYUP 配对
+    _device_mods = set()  # 已告知设备按住的修饰键（OH KeyCode）
+
+    def _sync_mods(mods):
+        """把 PC 修饰键状态同步到设备：先发需要按下的，再释放多余的。
+        修饰键作为普通键走 DOWN/UP 序列（uitest 同款机制，组合键生效）。"""
+        want = set()
+        if mods & pygame.KMOD_SHIFT:
+            want.add(2047)
+        if mods & pygame.KMOD_CTRL:
+            want.add(2072)
+        if mods & pygame.KMOD_ALT:
+            want.add(2045)
+        for m in _device_mods - want:
+            ctrl.key(m, False)
+            _device_mods.discard(m)
+        for m in want - _device_mods:
+            ctrl.key(m, True)
+            _device_mods.add(m)
+
+    def _map_keydown(event):
+        """KEYDOWN → (OH 键码, 按住修饰键位图)；无法映射返回 (None, 0)
+
+        大小写/符号完全由 PC 的物理修饰键状态驱动（pygame.key.get_mods 的
+        Shift/CapsLock 位），不依赖 event.unicode —— pygame2/SDL2 下 unicode
+        常为空（文本事件默认不启用），按字符驱动会整体失效。
+        """
+        key = event.key
+        mods = pygame.key.get_mods()
+        base_mods = ((OH_MOD_SHIFT if mods & pygame.KMOD_SHIFT else 0)
+                     | (OH_MOD_CTRL if mods & pygame.KMOD_CTRL else 0)
+                     | (OH_MOD_ALT if mods & pygame.KMOD_ALT else 0))
+        if key in OH_KEY_SPECIAL:
+            # 非字符键：PC 当前修饰键状态直接随事件携带（Shift+方向键选中文本等）
+            return OH_KEY_SPECIAL[key], base_mods
+        shift = bool(mods & pygame.KMOD_SHIFT)
+        caps = bool(mods & pygame.KMOD_CAPS)
+        if pygame.K_a <= key <= pygame.K_z:
+            # 字母：Shift 与 CapsLock 异或决定大写（设备侧无 CapsLock 状态）
+            return 2017 + key - pygame.K_a, ((OH_MOD_SHIFT if (shift != caps) else 0)
+                                             | (base_mods & ~OH_MOD_SHIFT))
+        if pygame.K_0 <= key <= pygame.K_9:
+            return 2000 + key - pygame.K_0, base_mods
+        sym = OH_SYMBOLS.get(key)
+        if sym is not None:
+            return sym, base_mods
+        return None, 0
 
     # ── 读帧线程：阻塞 read 放到后台，主线程只做渲染 ──────────────────────
     _stop_event = threading.Event()
@@ -1094,12 +1175,28 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
                         _stop_event.set()
                         break
                     elif ctrl:
-                        oh_key = OH_KEY_MAP.get(event.key)
-                        if oh_key:
-                            _log(f"[input] 按键 {event.key} → {oh_key}")
-                            ctrl.key(oh_key, True)
-                            time.sleep(0.05)
-                            ctrl.key(oh_key, False)
+                        code, mods = _map_keydown(event)
+                        if code is None:
+                            # 修饰键物理键 / CapsLock：同步一次修饰键状态
+                            # （如 Shift 按下时提前告知设备，组合键由此生效）
+                            _sync_mods(pygame.key.get_mods())
+                        elif event.key in _pressed_keys:
+                            # 长按重复（set_repeat 产生）：重触发一次 DOWN/UP
+                            # 让设备持续响应；修饰键状态不变
+                            held_code, held_mods = _pressed_keys[event.key]
+                            _sync_mods(held_mods)
+                            ctrl.key(held_code, False)
+                            ctrl.key(held_code, True)
+                        else:
+                            _sync_mods(mods)
+                            ctrl.key(code, True)
+                            _pressed_keys[event.key] = (code, mods)
+                elif event.type == pygame.KEYUP:
+                    st = _pressed_keys.pop(event.key, None)
+                    if st and ctrl:
+                        code, mods = st
+                        ctrl.key(code, False)
+                        _sync_mods(mods)  # 释放随键代按的修饰键（如 Shift）
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     if ctrl:
                         dx, dy = _map_mouse(*event.pos)

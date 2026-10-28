@@ -20,6 +20,7 @@
 #include <atomic>
 #include <thread>
 #include <string>
+#include <vector>
 
 namespace OHOS {
 namespace MMI {
@@ -111,7 +112,12 @@ private:
     void InjectMouseButton(int32_t x, int32_t y, uint8_t button, int32_t action);
     void InjectMouseScroll(int32_t x, int32_t y, int32_t delta);
     void InjectTouch      (int32_t action, uint8_t fingerId, int32_t x, int32_t y);
+    // 维护按住键状态：DOWN 事件携带全部按住键的 KeyItem（组合键判定依据），
+    // UP 事件只携带被释放的键；修饰键由客户端按 PC 修饰状态发 DOWN/UP 序列
     void InjectKey        (int32_t action, int32_t keyCode);
+
+    // 当前按住的键（注入 DOWN 时随事件携带，UP 时移除）
+    std::vector<int32_t> pressedKeys_;
 
     // 给注入事件设置目标屏幕（targetDisplayId_ >= 0 时生效）
     void ApplyTargetDisplay(OHOS::MMI::InputEvent *event);

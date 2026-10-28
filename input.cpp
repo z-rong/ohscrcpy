@@ -29,6 +29,7 @@
 #include <cstring>
 #include <cerrno>
 #include <chrono>
+#include <algorithm>
 
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -464,14 +465,39 @@ void InputServer::InjectKey(int32_t action, int32_t keyCode)
     auto event = KeyEvent::Create();
     if (!event) { return; }
 
-    KeyEvent::KeyItem item;
-    item.SetKeyCode(keyCode);
-    item.SetDownTime(NowUs());
-    item.SetPressed(action == KeyEvent::KEY_ACTION_DOWN);
-
-    event->SetKeyAction(action);
-    event->AddKeyItem(item);
-    event->SetKeyCode(keyCode);
+    // 镜像 arkxtest uitest SysUiController::InjectKeyEventSequence 的做法：
+    // DOWN 事件携带「全部按住键」的 KeyItem（框架/输入法的组合键判定与
+    // 键转字符都读事件内的按住键列表，IsShiftPressed → GetPressedKeys）；
+    // UP 事件只携带被释放的键。修饰键（Shift/Ctrl/Alt）由客户端按 PC
+    // 修饰键状态先发 DOWN、后发 UP，走同一条路径。
+    if (action == KeyEvent::KEY_ACTION_DOWN) {
+        if (std::find(pressedKeys_.begin(), pressedKeys_.end(), keyCode)
+            == pressedKeys_.end()) {
+            pressedKeys_.push_back(keyCode);
+        }
+        for (int32_t code : pressedKeys_) {
+            KeyEvent::KeyItem item;
+            item.SetKeyCode(code);
+            item.SetPressed(true);
+            event->AddKeyItem(item);
+        }
+        event->SetKeyAction(KeyEvent::KEY_ACTION_DOWN);
+        event->SetKeyCode(keyCode);
+    } else {
+        auto it = std::find(pressedKeys_.begin(), pressedKeys_.end(), keyCode);
+        if (it == pressedKeys_.end()) {
+            // 没有对应 DOWN 的 UP 会被框架丢弃
+            HILOG_WARN(LOG_CORE, "KeyUp without KeyDown: %{public}d", keyCode);
+            return;
+        }
+        pressedKeys_.erase(it);
+        KeyEvent::KeyItem item;
+        item.SetKeyCode(keyCode);
+        item.SetPressed(false);
+        event->AddKeyItem(item);
+        event->SetKeyAction(KeyEvent::KEY_ACTION_UP);
+        event->SetKeyCode(keyCode);
+    }
     ApplyTargetDisplay(event.get());
 
     InputManager::GetInstance()->SimulateInputEvent(event);
