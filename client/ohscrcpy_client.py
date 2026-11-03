@@ -19,8 +19,10 @@ ohscrcpy_client.py — OpenHarmony 投屏客户端
 """
 
 import argparse
+import collections
 import os
 import re
+import select
 import socket
 import struct
 import subprocess
@@ -92,6 +94,42 @@ def find_ffmpeg():
     """优先用打包内置的 ffmpeg.exe，否则依赖 PATH"""
     p = find_resource("ffmpeg.exe") if os.name == "nt" else find_resource("ffmpeg")
     return p or "ffmpeg"
+
+# ── ffmpeg 解码方式识别（debug 日志）─────────────────────────────────────────
+# 硬件加速解码成功时，ffmpeg verbose 日志里 "pix_fmt:" 是硬件帧格式；
+# 软解保持 yuv420p 之类软件格式。实测（内嵌 ffmpeg n6.0，Windows）：
+#   硬解: "Using auto hwaccel type dxva2 with new default device."
+#         "Reinit context to 1920x1080, pix_fmt: dxva2_vld"
+#   软解: "Reinit context to 1920x1080, pix_fmt: yuv420p"
+_HW_PIX_FMTS = {
+    "d3d11", "d3d11_vld", "dxva2_vld", "cuda", "qsv", "vaapi", "vaapi_vld",
+    "vdpau", "videotoolbox", "mediacodec", "opencl", "vulkan", "drm_prime",
+}
+# 由 _drain_stderr 线程解析 stderr 后写入，主线程只读
+_ffmpeg_decode = {"mode": None, "detail": "", "threads": 1}
+
+
+def _decode_mode_label():
+    """当前解码方式的一句话描述（用于 [stat] 行）"""
+    d = _ffmpeg_decode
+    if d["mode"] == "hw":
+        return f"解码=硬解({d['detail']}, threads={d['threads']})"
+    if d["mode"] == "sw":
+        return f"解码=软解({d['detail']}, threads={d['threads']})"
+    return "解码=未知(未见pix_fmt日志)"
+
+
+def _has_vcl_nalu(data):
+    """缓冲里是否含 VCL NALU（type 1/5）。只有 VCL 包会产出一帧解码输出，
+    SPS/PPS/SEI 不算，用于「已写入 ffmpeg、还没解出」的积压计数。"""
+    pos = 0
+    while True:
+        i = data.find(b"\x00\x00\x01", pos)
+        if i < 0 or i + 3 >= len(data):
+            return False
+        if (data[i + 3] & 0x1F) in (1, 5):
+            return True
+        pos = i + 3
 
 # ── HdcSession：hdc 自动化 ───────────────────────────────────────────────────
 class HdcSession:
@@ -647,7 +685,7 @@ class CtrlClient:
 # ── NALU 转发：TCP → ffmpeg pipe → rawvideo → pygame ─────────────────────────
 class NaluRelay:
     """从 TCP 收 NALU，剥头后写入 ffmpeg stdin，供读帧线程消费"""
-    def __init__(self, host, port, record_path=None):
+    def __init__(self, host, port, record_path=None, decode_threads=1):
         self._host = host
         self._port = port
         self._running = False
@@ -663,6 +701,23 @@ class NaluRelay:
         self._record_path = record_path
         self._record_file = None
         self._first_data = threading.Event()   # 收到首个 NALU 后置位
+        self._decode_threads = max(1, int(decode_threads))
+        # ── debug 统计（[stat] 行数据源，snapshot_stat() 消费）─────────────
+        self._stat_lock = threading.Lock()
+        self._st = {
+            "recv_nalus":    0,     # 从 TCP 收到的 NALU 数（含帧头开销另计 recv_bytes）
+            "recv_bytes":    0,     # 收到的 NALU 负载字节
+            "written_nalus": 0,     # 成功写入 ffmpeg stdin 的 NALU 数
+            "write_ms_sum":  0.0,   # stdin.write+flush 耗时累计（被阻塞=管道满=解码跟不上）
+            "write_ms_max":  0.0,
+            "tcp_backlog":   -1,    # 内核 TCP 接收缓冲积压字节（-1=未采样；≥1MB 时封顶）
+            "pipe_frames":   0,     # 已写入 ffmpeg、尚未解码输出的帧数（解码前积压）
+            "decode_lag_ms": 0.0,   # 最新一帧「写入 stdin → 解码输出」耗时
+            "decode_lag_ms_max": 0.0,
+            "last_recv_pts": 0,
+        }
+        # VCL NALU 的写入时刻队列：长度=解码前积压帧数，队首元素用于算解码滞后
+        self._pipe_queue = collections.deque(maxlen=512)
 
     def wait_first_data(self, timeout):
         """等待首个视频 NALU 到达，返回是否已收到"""
@@ -713,12 +768,54 @@ class NaluRelay:
             return self._ffmpeg.stdout
         return None
 
+    def note_frame_decoded(self):
+        """读帧线程回调：解码出一帧。与写入队列的队首配对，算出这一帧从
+        「写入 ffmpeg stdin」到「解码输出」的滞后（覆盖管道+解码器内部积压）。"""
+        entry = None
+        with self._stat_lock:
+            if self._pipe_queue:
+                entry = self._pipe_queue.popleft()
+            self._st["pipe_frames"] = len(self._pipe_queue)
+            if entry is not None:
+                lag = (time.perf_counter() - entry[1]) * 1000.0
+                self._st["decode_lag_ms"] = lag
+                if lag > self._st["decode_lag_ms_max"]:
+                    self._st["decode_lag_ms_max"] = lag
+
+    def snapshot_stat(self):
+        """取一份统计快照（累计计数保留，窗口类归零），由 [stat] 定期消费"""
+        with self._stat_lock:
+            s = dict(self._st)
+            self._st["write_ms_sum"] = 0.0
+            self._st["write_ms_max"] = 0.0
+            self._st["decode_lag_ms_max"] = 0.0
+            return s
+
+    def _sample_tcp_backlog(self, sock):
+        """采样内核 TCP 接收缓冲里的积压字节（MSG_PEEK 不消费数据）。
+        持续增长 = 收包快于解码消费，延迟正在累积（此时缓冲的是没解的码流）。
+        上限 1MB：再多的积压只会显示成 ≥1MB。"""
+        try:
+            readable, _, _ = select.select([sock], [], [], 0)
+            if readable:
+                backlog = len(sock.recv(1 << 20, socket.MSG_PEEK))
+            else:
+                backlog = 0
+            with self._stat_lock:
+                self._st["tcp_backlog"] = backlog
+        except (OSError, ValueError):
+            pass
+
     def _start_ffmpeg(self):
-        """启动 ffmpeg，硬件解码 H.264，输出 bgr24 到 stdout（pipe:1）"""
-        cmd = [
-            find_ffmpeg(),
-            "-hide_banner",
-            "-loglevel", "error",
+        """启动 ffmpeg，硬件加速优先解码 H.264，输出 bgr24 到 stdout（pipe:1）。
+
+        debug 模式下用 verbose 日志启动（实测 h264 解码在 verbose 下只有启动
+        时几十行、不逐帧刷屏），_drain_stderr 据此解析实际走的硬解还是软解。"""
+        if VERBOSE:
+            head = [find_ffmpeg(), "-hide_banner", "-loglevel", "verbose", "-nostats"]
+        else:
+            head = [find_ffmpeg(), "-hide_banner", "-loglevel", "error"]
+        cmd = head + [
             # 低延迟输入
             "-fflags", "nobuffer",
             "-flags", "low_delay",
@@ -727,7 +824,7 @@ class NaluRelay:
             "-analyzeduration", "0",
             "-probesize", "32",
             "-hwaccel", "auto",
-            "-threads", "1",
+            "-threads", str(self._decode_threads),
             "-f", "h264",
             "-i", "pipe:0",
             # 低延迟输出
@@ -743,6 +840,8 @@ class NaluRelay:
             "-f", "rawvideo",
             "pipe:1",
         ]
+        _ffmpeg_decode["threads"] = self._decode_threads
+        _log("[ffmpeg] 命令行: " + " ".join(cmd))
         return subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -752,14 +851,45 @@ class NaluRelay:
         )
 
     def _drain_stderr(self, ffmpeg):
-        """持续读取 ffmpeg stderr，打印所有诊断信息"""
+        """持续读取 ffmpeg stderr，打印所有诊断信息，并解析解码方式"""
         try:
             for line in iter(ffmpeg.stderr.readline, b''):
                 msg = line.decode('utf-8', 'replace').rstrip()
                 if msg:
+                    self._parse_ffmpeg_diag(msg)
                     print(f"[ffmpeg] {msg}")
         except Exception:
             pass
+
+    @staticmethod
+    def _parse_ffmpeg_diag(msg):
+        """从 ffmpeg 日志里识别硬解/软解与回退，结论只打印一次（debug 模式）"""
+        # "Reinit context to WxH, pix_fmt: xxx"：最终生效的像素格式是
+        # 硬解/软解的地面真值（auto 先选 hw 格式、初始化失败会退回 yuv420p）
+        m = re.search(r"pix_fmt:\s*(\w+)", msg)
+        if m:
+            pix = m.group(1)
+            mode = "hw" if pix in _HW_PIX_FMTS else "sw"
+            if mode != _ffmpeg_decode["mode"] or pix != _ffmpeg_decode["detail"]:
+                first = _ffmpeg_decode["mode"] is None
+                _ffmpeg_decode["mode"] = mode
+                _ffmpeg_decode["detail"] = pix
+                # 解码器上下文先按软格式初始化、hwaccel 协商完成后才切换，
+                # 第一条只是初始探测值，最终生效状态以 [stat] 行为准
+                note = ("（初始探测值，硬解协商后可能更新；最终以 [stat] 行为准）"
+                        if first else "")
+                if mode == "hw":
+                    _log(f"[ffmpeg] 解码方式: 硬件加速 (pix_fmt={pix}) {note}")
+                else:
+                    _log(f"[ffmpeg] 解码方式: 软件解码 (pix_fmt={pix}, "
+                         f"threads={_ffmpeg_decode['threads']}) {note}"
+                         f"—— 解码跟不上时可加大 --decode-threads "
+                         f"或降低 --server-args 分辨率/帧率")
+        m = re.search(r"Using auto hwaccel type (\w+)", msg)
+        if m:
+            _log(f"[ffmpeg] -hwaccel auto 选中: {m.group(1)}")
+        if "Failed setup for format" in msg:
+            _log(f"[ffmpeg] 警告: 硬件加速初始化失败（可能已回退软解）: {msg}")
 
     def _relay_loop(self):
         while self._running:
@@ -792,6 +922,10 @@ class NaluRelay:
 
                 # 启动 ffmpeg
                 self._ffmpeg_ready.clear()
+                # 上一轮连接遗留的未解码条目全部作废（配对基准已失效）
+                with self._stat_lock:
+                    self._pipe_queue.clear()
+                    self._st["pipe_frames"] = 0
                 self._ffmpeg = self._start_ffmpeg()
                 out_str = f" → {self._out_width}x{self._out_height}" if self._out_width > 0 else ""
                 print(f"[video] ffmpeg 已启动 pid={self._ffmpeg.pid}{out_str}")
@@ -820,6 +954,10 @@ class NaluRelay:
                 self._ffmpeg.stdin.flush()
                 if self._record_file:
                     self._record_file.write(first_nalu)
+                with self._stat_lock:
+                    self._st["recv_nalus"] += 1
+                    self._st["recv_bytes"] += len(first_nalu)
+                    self._st["written_nalus"] += 1
 
                 # 持续转发 NALU
                 nalu_count = 1
@@ -844,12 +982,37 @@ class NaluRelay:
                         print(f"[video] 断开: {e}")
                         break
 
+                    with self._stat_lock:
+                        self._st["recv_nalus"] += 1
+                        self._st["recv_bytes"] += size
+                        self._st["last_recv_pts"] = pts
+
+                    # write/flush 的耗时 = ffmpeg 消费管道的速度；明显变长说明
+                    # 解码跟不上、OS 管道缓冲已满，延迟开始积累
+                    t0 = time.perf_counter()
                     try:
                         self._ffmpeg.stdin.write(nalu)
                         self._ffmpeg.stdin.flush()
                     except BrokenPipeError:
                         print("[video] ffmpeg stdin 断开")
                         break
+                    write_ms = (time.perf_counter() - t0) * 1000.0
+                    with self._stat_lock:
+                        st = self._st
+                        st["written_nalus"] += 1
+                        st["write_ms_sum"] += write_ms
+                        if write_ms > st["write_ms_max"]:
+                            st["write_ms_max"] = write_ms
+                        if _has_vcl_nalu(nalu):
+                            # 出图包入队：队列长度=解码前积压帧数，
+                            # 队首条目用于算该帧的解码滞后
+                            self._pipe_queue.append((st["written_nalus"],
+                                                     time.perf_counter()))
+                            st["pipe_frames"] = len(self._pipe_queue)
+
+                    # debug：定期采样内核 TCP 接收缓冲积压
+                    if VERBOSE and nalu_count % 60 == 0:
+                        self._sample_tcp_backlog(sock)
 
                     if self._record_file is not None:
                         try:
@@ -936,7 +1099,7 @@ def run(args):
         # 直连模式：跳过 hdc 自动化，直接连接已就绪的服务端（调试用）
         print(f"[direct] 直连 {args.direct}:{args.video_port}/{args.ctrl_port}")
         _run_app(args.direct, args.video_port, args.ctrl_port,
-                 record_path=args.record)
+                 record_path=args.record, decode_threads=args.decode_threads)
         return
 
     hdc_session = HdcSession(args.target)
@@ -945,12 +1108,12 @@ def run(args):
         hdc_session.setup()
         # 使用本次会话实际分配到的端口（多设备时每个设备端口不同）
         _run_app("127.0.0.1", hdc_session.video_port, hdc_session.ctrl_port,
-                 record_path=args.record)
+                 record_path=args.record, decode_threads=args.decode_threads)
     finally:
         hdc_session.cleanup()
 
 
-def _run_app(host, video_port, ctrl_port, record_path=None):
+def _run_app(host, video_port, ctrl_port, record_path=None, decode_threads=1):
     """OpenCV 显示 + 输入控制主循环"""
     # Windows 缩放显示下按物理像素渲染（发虚的常见根源），须在 pygame.init 前
     enable_windows_high_dpi()
@@ -963,7 +1126,8 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
         print(f"[ctrl] 连接失败: {e}，以只读模式运行")
 
     # 启动 NALU 转发
-    relay = NaluRelay(host, video_port, record_path=record_path)
+    relay = NaluRelay(host, video_port, record_path=record_path,
+                      decode_threads=decode_threads)
     relay.start()
 
     # 等待屏幕数据：OH 动态帧率下静态画面编码器不出帧会一直无数据，
@@ -1125,6 +1289,7 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
         'dropped':       0,   # 解码快于渲染时丢弃的帧数
         'last_stat_t':   time.time(),
     }
+    _prev_relay_stat = None  # 上次 [stat] 的 relay 快照，用于算窗口增量
 
     def _read_thread():
         buf = bytearray(frame_size)
@@ -1150,6 +1315,8 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
                 # 转正画面（如 cvt 竖屏面板横用设备），零拷贝视图即可，
                 # make_surface 能处理带步长的数组
                 arr = np.rot90(arr, rot_k)
+            # 与写入侧配对：更新解码前积压帧数与该帧的「写入→解码输出」滞后
+            relay.note_frame_decoded()
             with _frame_lock:
                 if _latest_frame[0] is not None:
                     _stat['dropped'] += 1   # 渲染没来得及取，直接覆盖
@@ -1259,8 +1426,26 @@ def _run_app(host, video_port, ctrl_port, record_path=None):
             if elapsed >= 10.0:
                 dec_fps = _stat['decode_frames'] / elapsed
                 ren_fps = _stat['render_frames'] / elapsed
-                _log(f"[stat] decode={dec_fps:.1f}fps  render={ren_fps:.1f}fps"
-                     f"  dropped={_stat['dropped']}  elapsed={elapsed:.1f}s")
+                rs = relay.snapshot_stat()
+                prev = _prev_relay_stat
+                def _delta(key):
+                    return rs[key] - (prev[key] if prev else 0)
+                recv_rate = _delta('recv_nalus') / elapsed
+                write_rate = _delta('written_nalus') / elapsed
+                wr_n = _delta('written_nalus')
+                # write_ms_sum 是窗口值（snapshot 时归零），直接用快照值
+                avg_ms = (rs['write_ms_sum'] / wr_n) if wr_n > 0 else 0.0
+                bl = rs['tcp_backlog']
+                bl_str = ("未采样" if bl < 0
+                          else f"{bl / 1024:.0f}KB" + ("(≥1MB)" if bl >= (1 << 20) else ""))
+                _log(f"[stat] decode={dec_fps:.1f}fps render={ren_fps:.1f}fps"
+                     f" dropped={_stat['dropped']}"
+                     f" | 收 {recv_rate:.1f}包/s 写 {write_rate:.1f}包/s"
+                     f" | 解码前积压 {rs['pipe_frames']}帧 TCP积压 {bl_str}"
+                     f" | ffmpeg写入 avg={avg_ms:.1f}ms max={rs['write_ms_max']:.1f}ms"
+                     f" 解码滞后={rs['decode_lag_ms']:.0f}ms"
+                     f" | {_decode_mode_label()}")
+                _prev_relay_stat = rs
                 _stat['decode_frames'] = _stat['render_frames'] = _stat['dropped'] = 0
                 _stat['last_stat_t'] = now
 
@@ -1298,6 +1483,9 @@ def parse_args():
     p.add_argument("--max-height", type=int, default=0, metavar="N",
                    help="窗口初始最大高度像素；0（默认）= 按设备原始分辨率 1:1 显示，"
                         "超过屏幕时自动缩小到屏幕内")
+    p.add_argument("--decode-threads", type=int, default=1, metavar="N",
+                   help="ffmpeg 解码线程数（默认 1）。-v 下 [stat] 显示软解且解码"
+                        "fps 低于收包速率（延迟持续增长）时，弱机上可调大")
     p.add_argument("--server-args", default="", metavar="ARGS",
                    help="追加传给设备端 ohscrcpy 的参数，用于调画质，"
                         "如 --server-args \"-b 20000000 -i 500\"")

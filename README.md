@@ -202,6 +202,33 @@ hdc file recv /data/capture.h264 ./capture.h264
 ffplay capture.h264
 ```
 
+### 排查延迟/卡顿（客户端 debug 日志，仅 `-v` 模式打印）
+
+客户端加 `-v` 启动后，ffmpeg 以 verbose 日志启动，可直接看出实际走的是硬解还是软解：
+
+```
+[ffmpeg] -hwaccel auto 选中: dxva2
+[ffmpeg] 解码方式: 硬件加速 (pix_fmt=dxva2_vld)
+```
+
+软解时打印 `软件解码 (pix_fmt=yuv420p, threads=N)`；硬件加速初始化失败回退软解时会有
+`Failed setup for format ...` 警告日志。每 10 秒还输出一条 `[stat]` 汇总：
+
+```
+[stat] decode=29.8fps render=29.8fps dropped=0 | 收 30.1包/s 写 30.1包/s | 解码前积压 3帧 TCP积压 0KB | ffmpeg写入 avg=0.3ms max=2.1ms 解码滞后=45ms | 解码=硬解(dxva2_vld, threads=1)
+```
+
+| 字段 | 含义 | 排查信号 |
+|---|---|---|
+| decode / render fps | 解码/渲染速率 | 持续低于「收 包/s」说明消费跟不上，延迟会持续增长 |
+| 解码前积压 | 已写入 ffmpeg、尚未解码输出的帧数 | **持续增长** = 解码是瓶颈。启动后会先填出一个固定基数（管道预填），看趋势不看绝对值 |
+| TCP积压 | 内核 TCP 接收缓冲滞留字节 | 持续增长 = hdc 转发/链路带宽跟不上 |
+| ffmpeg写入 avg/max | 写 ffmpeg stdin 的阻塞耗时 | max 频繁到几十 ms = 解码消费变慢、管道回压 |
+| 解码滞后 | 最新一帧「写入 ffmpeg → 解码输出」耗时 | 与积压同源，反映解码侧总缓冲时长 |
+
+弱机软解跟不上时：`--decode-threads N` 调大解码线程数（默认 1），或用
+`--server-args` 降低设备端分辨率/帧率。
+
 ### 4. 客户端操作
 
 | 操作 | 功能 |
