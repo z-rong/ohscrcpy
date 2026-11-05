@@ -191,6 +191,27 @@ python ohscrcpy_client.py -t <device_id> -v
 客户端会自动完成：推送二进制 → 端口转发 → 启动服务端 → 连接 → 显示画面。
 退出时自动清理（杀进程、删文件、移除转发）。
 
+### 屏幕旋转跟随
+
+真实屏设备运行中旋转（应用横竖屏切换、系统自动旋转）时，投屏画面与反控坐标
+会自动跟随，无需重启：
+
+- **服务端**：启动时通过 `DisplayManagerLite::RegisterDisplayListener` 注册显示
+  事件监听（事件回调，非轮询）。屏幕方向变化时 `OnChange` 在约 1ms 内把新角度
+  写进帧头 `rotation` 字段。编码画布尺寸不变（编码器固定 1920×1080 等），
+  RS 采集跟随旋转会把新方向的画面旋转进固定画布。
+- **客户端**：逐帧读取帧头 `rotation`，检测到变化后重算转正角度
+  （`np.rot90`）与设备逻辑分辨率（90/270 时宽高互换），显示与鼠标映射
+  （`_map_mouse`）随之切换到新方向。反控坐标直接按转正后的逻辑坐标系发送，
+  服务端无需再做变换 —— MMI 注入使用的正是该坐标系。
+- 旋转瞬间新旧帧交替时最多有一两帧转正角度用错（内容与帧头更新不同步），
+  旋转完成后立即正常。
+
+调试辅助：`ohscrcpy --set-orientation <n>` 可在设备上主动设置屏幕方向后退出
+（0=恢复 1=竖屏 2=横屏 3=倒竖 4=倒横），用于触发旋转验证监听与坐标换算；
+`client/test_rotation.py` 是配套的无头回归脚本（不开窗口，自动验证旋转帧头
+与点击坐标，用法 `python test_rotation.py <deviceId>`）。
+
 ### 调试：导出 H.264 码流
 
 服务端支持 `--debug` 选项，开启后会把编码出的 H.264 码流（Annex-B 格式）写入
@@ -254,5 +275,6 @@ ffplay capture.h264
 | `include/input.h` | 输入控制服务接口及控制协议定义 |
 | `BUILD.gn` | GN 构建脚本 |
 | `client/ohscrcpy_client.py` | Python 客户端（ffmpeg 解码 + pygame 渲染） |
+| `client/test_rotation.py` | 旋转跟随无头回归脚本（验证旋转帧头与点击坐标） |
 | `client/build_exe.ps1` | 打包单文件 exe 的脚本（内嵌 ffmpeg 与设备端二进制） |
 

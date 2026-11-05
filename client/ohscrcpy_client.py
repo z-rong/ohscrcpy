@@ -693,6 +693,7 @@ class NaluRelay:
         self._dev_width = 0
         self._dev_height = 0
         self._rotation = 0    # 画面相对正立方向的旋转角（0/90/180/270）
+        self._rot_seq = 0     # rotation 变化次数：运行中屏幕旋转时递增，主循环据此重算映射
         self._out_width = 0    # ffmpeg 输出分辨率（0=不缩放）
         self._out_height = 0
         self._sock = None
@@ -758,8 +759,12 @@ class NaluRelay:
         return 1200, 1920  # 默认
 
     def get_rotation(self):
-        """画面相对正立方向的旋转角（0/90/180/270），来自帧头"""
+        """画面相对正立方向的旋转角（0/90/180/270），来自帧头，随屏幕旋转实时更新"""
         return self._rotation
+
+    def get_rot_seq(self):
+        """rotation 变化计数器：主循环比对该值即可感知运行中的屏幕旋转"""
+        return self._rot_seq
 
     def wait_ffmpeg(self, timeout=10.0):
         """等待 ffmpeg 启动完成，返回 stdout（可读帧数据），超时返回 None"""
@@ -913,6 +918,7 @@ class NaluRelay:
                 self._dev_width = dev_w
                 self._dev_height = dev_h
                 self._rotation = rotation if rotation in (0, 90, 180, 270) else 0
+                self._rot_seq = 1
                 self._first_data.set()
                 rot_str = f" rotation={self._rotation}" if self._rotation else ""
                 print(f"[video] 编码分辨率 {dev_w}x{dev_h}{rot_str}")
@@ -975,6 +981,15 @@ class NaluRelay:
                     if magic != FRAME_MAGIC or size <= 0 or size > 8 * 1024 * 1024:
                         print(f"[video] NALU 异常，重连")
                         break
+
+                    # 运行中屏幕旋转：服务端帧头 rotation 变化，递增 seq 通知主循环
+                    # 重算转正角度与设备逻辑分辨率（编码分辨率不变，画布尺寸固定）
+                    if rotation in (0, 90, 180, 270) and rotation != self._rotation:
+                        print(f"[video] 帧头 rotation 变化: {self._rotation} -> {rotation}")
+                        self._rotation = rotation
+                        self._rot_seq += 1
+                    self._dev_width = dev_w
+                    self._dev_height = dev_h
 
                     try:
                         nalu = recv_exact(sock, size)
@@ -1146,26 +1161,29 @@ def _run_app(host, video_port, ctrl_port, record_path=None, decode_threads=1):
     print("[main] 等待设备分辨率...")
     coded_w, coded_h = relay.get_resolution()
     rotation = relay.get_rotation()
-    # 编码帧方向（coded）与显示/逻辑方向（dev）可能不同：cvt 等竖屏物理面板当
-    # 横屏用的设备按物理面板方向编码（如 1200x1920），画面相对正立方向旋转了
-    # rotation 度；转正后宽高互换，且恰好等于设备逻辑分辨率（如 1920x1200），
-    # 所以反控坐标直接按 dev_w/dev_h 映射即可，无需再做旋转变换。
-    if rotation in (90, 270):
-        dev_w, dev_h = coded_h, coded_w
-    else:
-        dev_w, dev_h = coded_w, coded_h
-        rotation = 0
-    # np.rot90 的次数：转正画面。rotation=270 → 逆时针 90°（k=1），以此类推
-    rot_k = (4 - rotation // 90) % 4
+    # 编码帧方向（coded）与显示/逻辑方向（dev）可能不同：画面相对正立方向旋转了
+    # rotation 度；转正后宽高互换，且恰好等于设备逻辑分辨率，反控坐标按
+    # dev_w/dev_h 映射即可。
+    # 屏幕可在运行中旋转（服务端 DMS 旋转监听实时更新帧头 rotation），所以
+    # 转正角度/逻辑分辨率不能只算一次 —— 放进 rot_state，主循环检测到
+    # rot_seq 变化后重算，显示与反控坐标随之切换到新方向。
+    rot_state = {
+        "seq": relay.get_rot_seq(),
+        "rotation": rotation,
+        "dev_w": coded_h if rotation in (90, 270) else coded_w,
+        "dev_h": coded_w if rotation in (90, 270) else coded_h,
+        # np.rot90 的次数：转正画面。rotation=270 → 逆时针 90°（k=1），以此类推
+        "rot_k": (4 - rotation // 90) % 4,
+    }
 
     # 计算窗口初始尺寸：默认按设备原始分辨率 1:1（最清晰），--max-height 可限制
     max_h = MAX_HEIGHT
-    if max_h > 0 and dev_h > max_h:
-        _scale = max_h / dev_h
-        win_w = int(dev_w * _scale)
+    if max_h > 0 and rot_state["dev_h"] > max_h:
+        _scale = max_h / rot_state["dev_h"]
+        win_w = int(rot_state["dev_w"] * _scale)
         win_h = max_h
     else:
-        win_w, win_h = dev_w, dev_h
+        win_w, win_h = rot_state["dev_w"], rot_state["dev_h"]
 
     # 窗口必须装得进屏幕：设备分辨率往往比显示器还大（如 1260x2720 的手机屏
     # 对 1920x1080 的显示器），按 1:1 建出来的窗口会超出桌面，标题栏（含最小化/
@@ -1204,26 +1222,26 @@ def _run_app(host, video_port, ctrl_port, record_path=None, decode_threads=1):
     pygame.display.set_caption("ohscrcpy")
     clock = pygame.time.Clock()
 
-    out_w, out_h = dev_w, dev_h  # ffmpeg 输出原始分辨率
-
     def _map_mouse(px, py):
-        """把 pygame 窗口坐标映射回设备坐标（letterbox 感知）"""
+        """把 pygame 窗口坐标映射回设备坐标（letterbox 感知，跟随屏幕方向动态变化）"""
+        dw, dh = rot_state["dev_w"], rot_state["dev_h"]
         sw, sh = screen.get_size()
-        scale = min(1.0, sw / dev_w, sh / dev_h)
-        disp_w = int(dev_w * scale)
-        disp_h = int(dev_h * scale)
+        scale = min(1.0, sw / dw, sh / dh)
+        disp_w = int(dw * scale)
+        disp_h = int(dh * scale)
         ox = (sw - disp_w) // 2
         oy = (sh - disp_h) // 2
         lx = px - ox
         ly = py - oy
         if disp_w > 0 and disp_h > 0:
-            dx = int(lx * dev_w / disp_w)
-            dy = int(ly * dev_h / disp_h)
+            dx = int(lx * dw / disp_w)
+            dy = int(ly * dh / disp_h)
         else:
             dx, dy = px, py
-        return max(0, min(dev_w - 1, dx)), max(0, min(dev_h - 1, dy))
+        return max(0, min(dw - 1, dx)), max(0, min(dh - 1, dy))
 
-    print(f"[main] 设备 {dev_w}x{dev_h}（编码 {coded_w}x{coded_h} rotation={rotation}），窗口 {win_w}x{win_h}")
+    print(f"[main] 设备 {rot_state['dev_w']}x{rot_state['dev_h']}"
+          f"（编码 {coded_w}x{coded_h} rotation={rot_state['rotation']}），窗口 {win_w}x{win_h}")
     print("[main] 鼠标点击/拖动=触摸注入  PC键盘可输入  Esc=退出")
 
     frame_size = coded_w * coded_h * 3  # BGR = 3 bytes/pixel，ffmpeg 按编码帧方向输出
@@ -1311,10 +1329,13 @@ def _run_app(host, video_port, ctrl_port, record_path=None, decode_threads=1):
                 return
 
             arr = np.frombuffer(buf, dtype=np.uint8).reshape((coded_h, coded_w, 3)).copy()
-            if rot_k:
+            # 转正角度每帧实时读取：屏幕旋转瞬间新旧帧交替时最多有一两帧
+            # 用错角度（内容与帧头更新不同步），不影响旋转完成后的显示
+            k = rot_state["rot_k"]
+            if k:
                 # 转正画面（如 cvt 竖屏面板横用设备），零拷贝视图即可，
                 # make_surface 能处理带步长的数组
-                arr = np.rot90(arr, rot_k)
+                arr = np.rot90(arr, k)
             # 与写入侧配对：更新解码前积压帧数与该帧的「写入→解码输出」滞后
             relay.note_frame_decoded()
             with _frame_lock:
@@ -1330,6 +1351,19 @@ def _run_app(host, video_port, ctrl_port, record_path=None, decode_threads=1):
     # ── 渲染主循环（pygame）────────────────────────────────────────────────────
     try:
         while not _stop_event.is_set():
+            # ── 屏幕方向变化检测：重算转正角度与设备逻辑分辨率 ──
+            # 编码分辨率（画布尺寸）固定不变，只有 rotation 变化
+            seq = relay.get_rot_seq()
+            if seq != rot_state["seq"]:
+                rot = relay.get_rotation()
+                rot_state["seq"] = seq
+                rot_state["rotation"] = rot
+                rot_state["dev_w"] = coded_h if rot in (90, 270) else coded_w
+                rot_state["dev_h"] = coded_w if rot in (90, 270) else coded_h
+                rot_state["rot_k"] = (4 - rot // 90) % 4
+                print(f"[main] 屏幕方向变化: rotation={rot}，设备 "
+                      f"{rot_state['dev_w']}x{rot_state['dev_h']}（编码 {coded_w}x{coded_h}）")
+
             # ── 事件处理 ──
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -1399,14 +1433,15 @@ def _run_app(host, video_port, ctrl_port, record_path=None, decode_threads=1):
 
             if frame is not None:
                 sw, sh = screen.get_size()
+                dw, dh = rot_state["dev_w"], rot_state["dev_h"]
                 # BGR → RGB（pygame 用 RGB）
                 frame_rgb = frame[:, :, ::-1]
                 surf = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
                 # letterbox 缩放：上限 1:1，绝不放大（放大必然发虚）
-                scale = min(1.0, sw / dev_w, sh / dev_h)
-                disp_w = int(dev_w * scale)
-                disp_h = int(dev_h * scale)
-                if disp_w != dev_w or disp_h != dev_h:
+                scale = min(1.0, sw / dw, sh / dh)
+                disp_w = int(dw * scale)
+                disp_h = int(dh * scale)
+                if disp_w != dw or disp_h != dh:
                     # 缩小显示用 smoothscale（双线性滤波）：窗口小于 1:1 时，
                     # 默认 scale 的最近邻采样会让细笔画文字闪烁/毛糙
                     surf = pygame.transform.smoothscale(surf, (disp_w, disp_h))

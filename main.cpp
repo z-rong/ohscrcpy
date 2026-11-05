@@ -55,18 +55,22 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <atomic>
 #include <string>
 #include <fcntl.h>
 #include <getopt.h>
 #include <unistd.h>
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "hilog/log.h"
 #include "capture.h"
 #include "server.h"
 #include "input.h"
 #include "display_manager_lite.h"
+#include "screen_manager.h"
+#include "screen.h"
 #include "virtual_display.h"
 
 #undef LOG_TAG
@@ -96,6 +100,9 @@ struct OhscrcpyConfig {
     uint32_t    densityDpi    = 240;
     int32_t     videoPort     = 8554;
     int32_t     ctrlPort      = 8555;
+    // 调试：>=0 时设置屏幕方向后立即退出（0=恢复UNSPECIFIED 1=竖屏 2=横屏 3=倒竖 4=倒横），
+    // 用于在设备上主动触发旋转、验证旋转监听与反控坐标换算
+    int32_t     setOrientation = -1;
     bool        debug         = false;  // 将编码后的 H.264 码流保存到 kDebugDumpPath
     std::string videoSockName = "ohscrcpy_video";
     std::string ctrlSockName  = "ohscrcpy_ctrl";
@@ -139,6 +146,9 @@ void PrintUsage(const char *prog)
         "                  （当前硬件不支持 cq/crf，本项无效）\n"
         "  --density <dpi> 虚拟屏密度（VPR = dpi/160），默认 240(=VPR1.5)\n"
         "                  画面发虚时改小：160 即 VPR 1.0，UI 按 1:1 渲染最清晰\n"
+        "  --set-orientation <n>\n"
+        "                  调试：设置屏幕方向后退出（0=恢复 1=竖屏 2=横屏 3=倒竖 4=倒横），\n"
+        "                  用于触发旋转验证旋转监听与反控坐标换算\n"
         "  --debug         将编码后的 H.264 码流保存到 %s\n"
         "  --help          打印此帮助\n"
         "\n"
@@ -146,6 +156,63 @@ void PrintUsage(const char *prog)
         "  %s -f 60 -b 20 --rate-mode crf --qp 20\n",
         kDebugDumpPath, prog, prog);
 }
+
+/**
+ * @brief 屏幕旋转监听（DMS 显示事件回调，非轮询）
+ *
+ * 真实屏设备运行中方向可能变化（应用横竖屏切换、系统自动旋转）。采集画布
+ * canvasFollowRotation=true 时 RS 会把新方向的画面旋转进固定尺寸的编码画布，
+ * 帧内容携带的旋转角随之变化 —— 必须把新角度实时写进帧头 rotation 字段，
+ * 客户端才能转正显示，并把反控坐标映射到当前方向的显示（逻辑）坐标系。
+ *
+ * 说明：反控坐标无需在服务端做额外变换 —— 客户端按帧头 rotation 转正后
+ * 得到的就是显示当前方向的逻辑坐标系（与 cvt 旋转屏开机即 rotation=90 的
+ * 既有行为一致），MMI 注入直接使用该坐标系。
+ */
+class RotationWatch : public OHOS::Rosen::DisplayManagerLite::IDisplayListener {
+public:
+    RotationWatch(Server *video, Capture *capture, int32_t initRotation)
+        : video_(video), capture_(capture), rotation_(initRotation)
+    {
+    }
+
+    void OnCreate(OHOS::Rosen::DisplayId) override {}
+    void OnDestroy(OHOS::Rosen::DisplayId) override {}
+
+    void OnChange(OHOS::Rosen::DisplayId displayId) override
+    {
+        auto display = OHOS::Rosen::DisplayManagerLite::GetInstance().GetDefaultDisplay();
+        if (display == nullptr) {
+            HILOG_WARN(LOG_CORE, "OnChange(displayId=%{public}llu): GetDefaultDisplay 为空",
+                       static_cast<unsigned long long>(displayId));
+            return;
+        }
+        // GetRotation() 返回档位枚举（ROTATION_0..ROTATION_270 = 0..3），乘 90 才是角度
+        int32_t rotation = static_cast<int32_t>(display->GetRotation()) * 90;
+        HILOG_INFO(LOG_CORE,
+                   "OnChange(displayId=%{public}llu): rotation=%{public}d（上次 %{public}d）",
+                   static_cast<unsigned long long>(displayId), rotation, rotation_.load());
+        int32_t prev = rotation_.exchange(rotation);
+        if (rotation == prev) {
+            // 与方向无关的显示变化（分辨率调整、冻结等）不触发
+            return;
+        }
+        HILOG_INFO(LOG_CORE, "屏幕旋转变化: %{public}d -> %{public}d 度，更新帧头 rotation",
+                   prev, rotation);
+        if (video_ != nullptr) {
+            video_->SetRotation(rotation);
+        }
+        if (capture_ != nullptr) {
+            // 尽快出一个含新方向的 IDR，客户端衔接更稳
+            capture_->RequestIDRFrame();
+        }
+    }
+
+private:
+    Server *video_;
+    Capture *capture_;
+    std::atomic<int32_t> rotation_;
+};
 } // namespace
 
 int main(int argc, char *argv[])
@@ -168,6 +235,7 @@ int main(int argc, char *argv[])
         {"rate-mode",  required_argument, nullptr, 1002},
         {"qp",         required_argument, nullptr, 1003},
         {"density",    required_argument, nullptr, 1004},
+        {"set-orientation", required_argument, nullptr, 1005},
         {nullptr,      0,          nullptr, 0},
     };
 
@@ -231,10 +299,53 @@ int main(int argc, char *argv[])
                 cfg.densityDpi = static_cast<uint32_t>(v);
                 break;
             }
+            case 1005: {
+                int32_t v = atoi(optarg);
+                if (v < 0 || v > 4) {
+                    fprintf(stderr, "错误: --set-orientation 取值 0~4，收到 \"%s\"\n", optarg);
+                    return 1;
+                }
+                cfg.setOrientation = v;
+                break;
+            }
             default:
                 PrintUsage(argv[0]);
                 return 1;
         }
+    }
+
+    // —— 调试：设置屏幕方向后立即退出 ——
+    // 用于在设备上主动触发旋转，验证旋转监听与反控坐标换算。
+    // 只做 DM 调用，不建采集/服务，可以和正在运行的 ohscrcpy 服务并存。
+    if (cfg.setOrientation >= 0) {
+        static const OHOS::Rosen::Orientation kOrientations[] = {
+            OHOS::Rosen::Orientation::UNSPECIFIED,        OHOS::Rosen::Orientation::VERTICAL,
+            OHOS::Rosen::Orientation::HORIZONTAL,         OHOS::Rosen::Orientation::REVERSE_VERTICAL,
+            OHOS::Rosen::Orientation::REVERSE_HORIZONTAL,
+        };
+        std::vector<OHOS::sptr<OHOS::Rosen::Screen>> screens;
+        if (OHOS::Rosen::ScreenManager::GetInstance().GetAllScreens(screens) !=
+                OHOS::Rosen::DMError::DM_OK || screens.empty()) {
+            HILOG_ERROR(LOG_CORE, "set-orientation: GetAllScreens 失败");
+            return 1;
+        }
+        OHOS::sptr<OHOS::Rosen::Screen> target;
+        for (const auto &screen : screens) {
+            if (screen != nullptr && screen->GetName() != "DevEcoViewer") {
+                target = screen;
+                break;
+            }
+        }
+        if (target == nullptr) {
+            target = screens[0];
+        }
+        OHOS::Rosen::DMError ret =
+            target->SetOrientation(kOrientations[cfg.setOrientation]);
+        HILOG_INFO(LOG_CORE, "set-orientation %{public}d -> ret=%{public}d",
+                   cfg.setOrientation, static_cast<int32_t>(ret));
+        fprintf(stderr, "SetOrientation(%d) ret=%d\n",
+                cfg.setOrientation, static_cast<int32_t>(ret));
+        return (ret == OHOS::Rosen::DMError::DM_OK) ? 0 : 1;
     }
 
     // —— 判断设备是否有【真实】屏幕 ——
@@ -386,6 +497,19 @@ int main(int argc, char *argv[])
         HILOG_INFO(LOG_CORE, "屏幕采集已启动（虚拟屏直连编码器 Surface）");
     }
 
+    // —— 注册屏幕旋转监听（仅真实屏设备；虚拟屏不会旋转）——
+    // 运行中屏幕方向变化时，OnChange 回调把新角度写进帧头 rotation，
+    // 客户端据此转正显示并把反控坐标映射到当前方向的显示坐标系
+    OHOS::sptr<RotationWatch> rotationWatch;
+    if (hasDisplay) {
+        rotationWatch = OHOS::sptr<RotationWatch>(
+            new RotationWatch(video.get(), capture.get(), displayRotation));
+        auto dmRet = OHOS::Rosen::DisplayManagerLite::GetInstance()
+                         .RegisterDisplayListener(rotationWatch);
+        HILOG_INFO(LOG_CORE, "屏幕旋转监听注册（初始 rotation=%{public}d）ret=%{public}d",
+                   displayRotation, static_cast<int32_t>(dmRet));
+    }
+
     // 明确告诉输入服务该往哪块屏注入：无屏设备上是刚建好的默认虚拟屏，
     // 有屏设备上就是真实默认屏。不指定时 MMI 只按「默认显示组第一个屏」推断，
     // 多屏（物理屏 + 虚拟屏、或遗留旧虚拟屏）时会注入到别的屏上 —— 表现为
@@ -403,6 +527,12 @@ int main(int argc, char *argv[])
     pause();
 
     if (h264Fd >= 0) { close(h264Fd); }
+    // 先注销旋转监听：避免退出过程中 OnChange 再触发、引用已释放的对象
+    if (rotationWatch != nullptr) {
+        OHOS::Rosen::DisplayManagerLite::GetInstance()
+            .UnregisterDisplayListener(rotationWatch);
+        rotationWatch = nullptr;
+    }
     // 回收本进程创建的虚拟屏。注意：虚拟屏已被设为默认屏，DMS 的
     // DestroyVirtualScreen 对默认屏一律拒绝（dmserver/abstract_screen_controller.cpp
     // 检查 rsScreenId == defaultRsScreenId_，含进程被杀时的 OnRemoteDied 兜底路径），

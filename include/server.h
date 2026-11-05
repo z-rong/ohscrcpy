@@ -92,8 +92,9 @@ public:
     /** 更新视频分辨率（每帧帧头携带，客户端自动适配窗口大小）*/
     void SetResolution(int32_t width, int32_t height) { width_ = width; height_ = height; }
 
-    /** 设置画面旋转角度（0/90/180/270），随每帧帧头下发给客户端 */
-    void SetRotation(int32_t rotation) { rotation_ = rotation; }
+    /** 设置画面旋转角度（0/90/180/270），随每帧帧头下发给客户端。
+     *  可在运行中调用（旋转监听回调线程），线程安全 */
+    void SetRotation(int32_t rotation) { rotation_.store(rotation); }
 
     /**
      * @brief 设置新客户端连接回调，用于触发 IDR 帧请求
@@ -133,7 +134,10 @@ private:
 
     int32_t  width_  = 0;  // 视频宽度，随每帧帧头下发
     int32_t  height_ = 0;  // 视频高度，随每帧帧头下发
-    int32_t  rotation_ = 0; // 画面旋转角（0/90/180/270），随每帧帧头下发
+    // 画面旋转角（0/90/180/270），随每帧帧头下发。
+    // 运行中屏幕方向变化时由旋转监听（main.cpp RotationWatch）在回调线程更新，
+    // PushNalu 在编码器回调线程读取，所以必须是 atomic
+    std::atomic<int32_t> rotation_{0};
 
     static constexpr uint32_t kMagic = 0x4F485343u; // "OHSC"
 };
